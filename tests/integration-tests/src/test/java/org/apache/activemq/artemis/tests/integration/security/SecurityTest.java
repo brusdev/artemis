@@ -38,6 +38,7 @@ import org.apache.activemq.ActiveMQConnection;
 import org.apache.activemq.ActiveMQSslConnectionFactory;
 import org.apache.activemq.artemis.api.core.ActiveMQException;
 import org.apache.activemq.artemis.api.core.ActiveMQSecurityException;
+import org.apache.activemq.artemis.api.config.ActiveMQDefaultConfiguration;
 import org.apache.activemq.artemis.api.core.QueueConfiguration;
 import org.apache.activemq.artemis.api.core.RoutingType;
 import org.apache.activemq.artemis.api.core.SimpleString;
@@ -78,12 +79,14 @@ import org.apache.activemq.artemis.utils.RandomUtil;
 import org.apache.activemq.artemis.utils.SensitiveDataCodec;
 import org.apache.activemq.artemis.utils.Wait;
 import org.apache.activemq.command.ActiveMQQueue;
+import org.apache.qpid.jms.JmsConnectionFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -2868,6 +2871,181 @@ public class SecurityTest extends ActiveMQTestBase {
          //ok
       } catch (ActiveMQException e) {
          fail("Invalid Exception type:" + e.getType());
+      }
+   }
+
+   @Test
+   public void testPopulateValidatedUserWithClusterCredentials() throws Exception {
+      ActiveMQJAASSecurityManager securityManager = new ActiveMQJAASSecurityManager("PropertiesLogin");
+      
+      // Create server with security enabled and PopulateValidatedUser set to true
+      Configuration config = createDefaultInVMConfig()
+         .setSecurityEnabled(true)
+         .setPopulateValidatedUser(true)
+         .setClusterUser(ActiveMQDefaultConfiguration.getDefaultClusterUser())
+         .setClusterPassword(ActiveMQDefaultConfiguration.getDefaultClusterPassword());
+      
+      ActiveMQServer server = addServer(ActiveMQServers.newActiveMQServer(config, ManagementFactory.getPlatformMBeanServer(), securityManager, false));
+      server.start();
+      
+      // Setup security roles
+      Role role = new Role("programmers", true, true, true, true, true, true, true, true, true, true, false, false);
+      Set<Role> roles = new HashSet<>();
+      roles.add(role);
+      server.getSecurityRepository().addMatch("#", roles);
+      
+      // Create queue for testing
+      server.createQueue(QueueConfiguration.of("test").setAddress("test").setRoutingType(RoutingType.ANYCAST));
+      
+      ClientSessionFactory cf = createSessionFactory(locator);
+      
+      ClientSession clusterSession = null;
+      try {
+         clusterSession = cf.createSession(
+            ActiveMQDefaultConfiguration.getDefaultClusterUser(),
+            ActiveMQDefaultConfiguration.getDefaultClusterPassword(),
+            false, true, true, false, 0);
+         
+         ClientProducer clusterProducer = clusterSession.createProducer("test");
+         ClientMessage clusterMessage = clusterSession.createMessage(true);
+         clusterMessage.getBodyBuffer().writeString("cluster message");
+         // Set false validate user.
+         clusterMessage.setValidatedUserID("joker");
+         clusterProducer.send(clusterMessage);
+         clusterSession.commit();
+         clusterProducer.close();
+         
+         // Consume the message and verify validated user is NOT set joker
+         ClientConsumer clusterConsumer = clusterSession.createConsumer("testQueue");
+         clusterSession.start();
+         ClientMessage receivedClusterMessage = clusterConsumer.receive(1000);
+         assertNotNull(receivedClusterMessage);
+         assertNotEquals("joker", receivedClusterMessage.getValidatedUserID(),
+            "Validated user should not be joker");
+         clusterConsumer.close();
+         
+      } finally {
+         if (clusterSession != null) {
+            clusterSession.close();
+         }
+      }
+   }
+
+   @Test
+   public void testPopulateValidatedUserWithClusterCredentialsJMS() throws Exception {
+      ActiveMQJAASSecurityManager securityManager = new ActiveMQJAASSecurityManager("PropertiesLogin");
+      
+      // Create server with security enabled and PopulateValidatedUser set to true
+      Configuration config = createDefaultInVMConfig()
+         .setSecurityEnabled(true)
+         .setPopulateValidatedUser(true)
+         .setClusterUser(ActiveMQDefaultConfiguration.getDefaultClusterUser())
+         .setClusterPassword(ActiveMQDefaultConfiguration.getDefaultClusterPassword());
+      
+      ActiveMQServer server = addServer(ActiveMQServers.newActiveMQServer(config, ManagementFactory.getPlatformMBeanServer(), securityManager, false));
+      server.start();
+
+      // Setup security roles
+      Role role = new Role("programmers", true, true, true, true, true, true, true, true, true, true, false, false);
+      Set<Role> roles = new HashSet<>();
+      roles.add(role);
+      server.getSecurityRepository().addMatch("#", roles);
+      
+      // Create queue for testing
+      server.createQueue(QueueConfiguration.of("test").setAddress("test").setRoutingType(RoutingType.ANYCAST));
+      
+      ConnectionFactory connectionFactory = new ActiveMQConnectionFactory("vm://0");
+      
+      Connection clusterConnection = null;
+      try {
+         clusterConnection = connectionFactory.createConnection(
+            ActiveMQDefaultConfiguration.getDefaultClusterUser(),
+            ActiveMQDefaultConfiguration.getDefaultClusterPassword());
+         Session clusterSession = clusterConnection.createSession(true, Session.AUTO_ACKNOWLEDGE);
+         
+         javax.jms.Queue queue = clusterSession.createQueue("test");
+         MessageProducer clusterProducer = clusterSession.createProducer(queue);
+         javax.jms.TextMessage clusterMessage = clusterSession.createTextMessage("cluster message");
+         
+         // Set false validate user using JMSXUserID
+         clusterMessage.setStringProperty("JMSXUserID", "joker");
+         
+         clusterProducer.send(clusterMessage);
+         clusterSession.commit();
+         clusterProducer.close();
+         
+         // Consume the message and verify validated user is NOT set joker
+         javax.jms.MessageConsumer clusterConsumer = clusterSession.createConsumer(queue);
+         clusterConnection.start();
+         javax.jms.TextMessage receivedClusterMessage = (javax.jms.TextMessage) clusterConsumer.receive(1000);
+         assertNotNull(receivedClusterMessage);
+         assertNotEquals("joker", receivedClusterMessage.getStringProperty("JMSXUserID"),
+            "Validated user should not be joker");
+         clusterConsumer.close();
+         
+      } finally {
+         if (clusterConnection != null) {
+            clusterConnection.close();
+         }
+      }
+   }
+
+   @Test
+   public void testPopulateValidatedUserWithClusterCredentialsQpidJMS() throws Exception {
+      ActiveMQJAASSecurityManager securityManager = new ActiveMQJAASSecurityManager("PropertiesLogin");
+      
+      // Create server with security enabled and PopulateValidatedUser set to true
+      Configuration config = createDefaultNettyConfig()
+         .setSecurityEnabled(true)
+         .setPopulateValidatedUser(true)
+         .setClusterUser(ActiveMQDefaultConfiguration.getDefaultClusterUser())
+         .setClusterPassword(ActiveMQDefaultConfiguration.getDefaultClusterPassword());
+      
+      ActiveMQServer server = addServer(ActiveMQServers.newActiveMQServer(config, ManagementFactory.getPlatformMBeanServer(), securityManager, false));
+      server.start();
+
+      // Setup security roles
+      Role role = new Role("programmers", true, true, true, true, true, true, true, true, true, true, false, false);
+      Set<Role> roles = new HashSet<>();
+      roles.add(role);
+      server.getSecurityRepository().addMatch("#", roles);
+      
+      // Create queue for testing
+      server.createQueue(QueueConfiguration.of("test").setAddress("test").setRoutingType(RoutingType.ANYCAST));
+      
+      JmsConnectionFactory connectionFactory = new JmsConnectionFactory("amqp://127.0.0.1:61616");
+      
+      Connection clusterConnection = null;
+      try {
+         clusterConnection = connectionFactory.createConnection(
+            ActiveMQDefaultConfiguration.getDefaultClusterUser(),
+            ActiveMQDefaultConfiguration.getDefaultClusterPassword());
+         Session clusterSession = clusterConnection.createSession(true, Session.AUTO_ACKNOWLEDGE);
+         
+         javax.jms.Queue queue = clusterSession.createQueue("test");
+         javax.jms.MessageProducer clusterProducer = clusterSession.createProducer(queue);
+         javax.jms.TextMessage clusterMessage = clusterSession.createTextMessage("cluster message");
+         
+         // Set false validate user using _AMQ_VALIDATED_USER property (AMQP equivalent of JMSXUserID)
+         clusterMessage.setStringProperty("_AMQ_VALIDATED_USER", "joker");
+         
+         clusterProducer.send(clusterMessage);
+         clusterSession.commit();
+         clusterProducer.close();
+         
+         // Consume the message and verify validated user is NOT set joker
+         javax.jms.MessageConsumer clusterConsumer = clusterSession.createConsumer(queue);
+         clusterConnection.start();
+         javax.jms.TextMessage receivedClusterMessage = (javax.jms.TextMessage) clusterConsumer.receive(1000);
+         assertNotNull(receivedClusterMessage);
+         assertNotEquals("joker", receivedClusterMessage.getStringProperty("_AMQ_VALIDATED_USER"),
+            "Validated user should not be joker");
+         clusterConsumer.close();
+         
+      } finally {
+         if (clusterConnection != null) {
+            clusterConnection.close();
+         }
       }
    }
 
