@@ -20,6 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
+import javax.jms.BytesMessage;
 import javax.jms.Connection;
 import javax.jms.JMSException;
 import javax.jms.Message;
@@ -28,6 +29,12 @@ import javax.jms.MessageProducer;
 import javax.jms.Queue;
 import javax.jms.Session;
 import javax.jms.TextMessage;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPathFactory;
+import java.io.ByteArrayInputStream;
+import java.io.StringReader;
 import java.net.URI;
 
 import org.apache.activemq.artemis.api.core.QueueConfiguration;
@@ -36,7 +43,10 @@ import org.apache.activemq.artemis.api.core.SimpleString;
 import org.apache.activemq.artemis.core.server.ActiveMQServer;
 import org.apache.activemq.artemis.core.server.impl.AddressInfo;
 import org.apache.activemq.artemis.core.settings.impl.AddressSettings;
+import org.apache.activemq.filter.XPathExpression;
 import org.junit.jupiter.api.Test;
+import org.w3c.dom.Document;
+import org.xml.sax.InputSource;
 
 public class JMSXPathSelectorTest extends MultiprotocolJMSClientTestSupport {
 
@@ -55,6 +65,9 @@ public class JMSXPathSelectorTest extends MultiprotocolJMSClientTestSupport {
    protected void addConfiguration(ActiveMQServer server) {
       server.getConfiguration().setPersistenceEnabled(false);
       server.getAddressSettingsRepository().addMatch(NORMAL_QUEUE_NAME, new AddressSettings());
+
+      //<!-- need this for org.apache.activemq.filter.JAXPXPathEvaluator for Xpath selectors with OpenWire JMS clients-->
+      System.setProperty("org.apache.activemq.XPathEvaluatorClassName", "org.apache.activemq.artemis.tests.integration.jms.multiprotocol.JMSXPathSelectorTest$JAXPXPathEvaluator");
    }
 
    @Override
@@ -152,6 +165,62 @@ public class JMSXPathSelectorTest extends MultiprotocolJMSClientTestSupport {
          TextMessage message2 = producerSession.createTextMessage();
          message2.setText(goodBody);
          p.send(queue1, message2, deliveryMode, priority, timeToLive);
+      }
+   }
+
+   public static class JAXPXPathEvaluator implements XPathExpression.XPathEvaluator {
+
+      private static final XPathFactory FACTORY = XPathFactory.newInstance();
+      private final String xpathExpression;
+      private final DocumentBuilder builder;
+      private final XPath xpath = FACTORY.newXPath();
+
+      public JAXPXPathEvaluator(String xpathExpression, DocumentBuilder builder) throws Exception {
+         this.xpathExpression = xpathExpression;
+         if (builder != null) {
+            this.builder = builder;
+         } else {
+            throw new RuntimeException("No document builder available");
+         }
+      }
+
+      @Override
+      public boolean evaluate(org.apache.activemq.command.Message message) throws JMSException {
+         if (message instanceof TextMessage) {
+            String text = ((TextMessage)message).getText();
+            return evaluate(text);
+         } else if (message instanceof BytesMessage) {
+            BytesMessage bm = (BytesMessage)message;
+            byte[] data = new byte[(int)bm.getBodyLength()];
+            bm.readBytes(data);
+            return evaluate(data);
+         }
+         return false;
+      }
+
+      private boolean evaluate(byte[] data) {
+         try {
+            InputSource inputSource = new InputSource(new ByteArrayInputStream(data));
+            Document inputDocument = builder.parse(inputSource);
+            return (Boolean) xpath.evaluate(xpathExpression, inputDocument, XPathConstants.BOOLEAN);
+         } catch (Exception e) {
+            return false;
+         }
+      }
+
+      private boolean evaluate(String text) {
+         try {
+            InputSource inputSource = new InputSource(new StringReader(text));
+            Document inputDocument = builder.parse(inputSource);
+            return (Boolean) xpath.evaluate(xpathExpression, inputDocument, XPathConstants.BOOLEAN);
+         } catch (Exception e) {
+            return false;
+         }
+      }
+
+      @Override
+      public String toString() {
+         return xpathExpression;
       }
    }
 }
