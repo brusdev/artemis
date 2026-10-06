@@ -17,6 +17,7 @@
 package org.apache.activemq.artemis.core.server.cluster;
 
 import org.apache.activemq.artemis.api.core.client.MessageHandler;
+import org.apache.activemq.artemis.api.core.client.ServerLocator;
 
 public interface MessageFlowRecord extends MessageHandler {
 
@@ -25,6 +26,8 @@ public interface MessageFlowRecord extends MessageHandler {
    int getMaxHops();
 
    Bridge getBridge();
+
+   ServerLocator getTargetLocator();
 
    void close() throws Exception;
 

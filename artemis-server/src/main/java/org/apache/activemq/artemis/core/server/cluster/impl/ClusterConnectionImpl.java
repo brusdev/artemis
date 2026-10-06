@@ -42,6 +42,7 @@ import org.apache.activemq.artemis.api.core.SimpleString;
 import org.apache.activemq.artemis.api.core.TransportConfiguration;
 import org.apache.activemq.artemis.api.core.client.ClientMessage;
 import org.apache.activemq.artemis.api.core.client.ClusterTopologyListener;
+import org.apache.activemq.artemis.api.core.client.ServerLocator;
 import org.apache.activemq.artemis.api.core.client.TopologyMember;
 import org.apache.activemq.artemis.api.core.management.CoreNotificationType;
 import org.apache.activemq.artemis.api.core.management.ManagementHelper;
@@ -981,27 +982,48 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
                // New node - create a new flow record
 
                final SimpleString queueName = getSfQueueName(nodeID);
-
-               Binding queueBinding = postOffice.getBinding(queueName);
-
-               Queue queue;
-
-               if (queueBinding != null) {
-                  queue = (Queue) queueBinding.getBindable();
-               } else {
-                  // Add binding in storage so the queue will get reloaded on startup and we can find it - it's never
-                  // actually routed to at that address though
-                  queue = server.createQueue(QueueConfiguration.of(queueName).setRoutingType(RoutingType.MULTICAST).setAutoCreateAddress(true).setMaxConsumers(-1).setPurgeOnNoConsumers(false).setInternal(true));
-               }
-
-               // There are a few things that will behave differently when it's an internal queue
-               // such as we don't hold groupIDs inside the SnF queue
-               queue.setInternalQueue(true);
+               Queue queue = getOrCreateSnFQueue(queueName);
 
                createNewRecord(topologyMember.getUniqueEventID(), nodeID, topologyMember.getPrimary(), queueName, queue, true);
             } else {
-               if (logger.isTraceEnabled()) {
-                  logger.trace("{} ignored nodeUp record for {} on nodeID={} as the record already existed", this, topologyMember, nodeID);
+               // A record can be left in a dead state when createNewRecord() raced with a
+               // concurrent shutdown: the bridge was instantiated but its ServerLocator was
+               // closed before the first connection attempt succeeded (AMQ222100).  In that
+               // case the record is non-null but the bridge will never become connected on
+               // its own.  Detect this precisely by checking isClosed() (explicit teardown)
+               // or whether the record's targetLocator has been closed (AMQ222100 scenario).
+               // We must NOT use !bridge.isConnected() alone because a brand-new replacement
+               // bridge that has just been started is also not yet connected, which would
+               // cause a second nodeUP to immediately replace the live replacement record.
+               Bridge existingBridge = record.getBridge();
+               boolean locatorClosed = record.getTargetLocator() != null &&
+                                       record.getTargetLocator().isClosed();
+               boolean bridgeDead = record.isClosed() ||
+                                    existingBridge == null ||
+                                    locatorClosed;
+               if (bridgeDead) {
+                  if (logger.isDebugEnabled()) {
+                     logger.debug("{}::Dead record detected for nodeID={} (isClosed={}, locatorClosed={}, bridgeConnected={}). Replacing with a new record.",
+                                  this, nodeID, record.isClosed(), locatorClosed,
+                                  existingBridge != null && existingBridge.isConnected());
+                  }
+                  try {
+                     record.close();
+                  } catch (Exception ignored) {
+                     logger.debug("Error closing dead record for nodeID={}", nodeID, ignored);
+                  }
+                  if (existingBridge != null) {
+                     existingBridge.flushExecutor();
+                  }
+                  records.remove(nodeID);
+
+                  final SimpleString queueName = getSfQueueName(nodeID);
+                  Queue queue = getOrCreateSnFQueue(queueName);
+                  createNewRecord(topologyMember.getUniqueEventID(), nodeID, topologyMember.getPrimary(), queueName, queue, true);
+               } else {
+                  if (logger.isTraceEnabled()) {
+                     logger.trace("{} ignored nodeUp record for {} on nodeID={} as the record already existed", this, topologyMember, nodeID);
+                  }
                }
             }
          } catch (Exception e) {
@@ -1041,6 +1063,22 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
    public BridgeMetrics getBridgeMetrics(String nodeId) {
       final MessageFlowRecord record = records.get(nodeId);
       return record != null && record.getBridge() != null ? record.getBridge().getMetrics() : null;
+   }
+
+   private Queue getOrCreateSnFQueue(final SimpleString queueName) throws Exception {
+      Binding queueBinding = postOffice.getBinding(queueName);
+      Queue queue;
+      if (queueBinding != null) {
+         queue = (Queue) queueBinding.getBindable();
+      } else {
+         // Add binding in storage so the queue will get reloaded on startup and we can find it - it's never
+         // actually routed to at that address though
+         queue = server.createQueue(QueueConfiguration.of(queueName).setRoutingType(RoutingType.MULTICAST).setAutoCreateAddress(true).setMaxConsumers(-1).setPurgeOnNoConsumers(false).setInternal(true));
+      }
+      // There are a few things that will behave differently when it's an internal queue
+      // such as we don't hold groupIDs inside the SnF queue
+      queue.setInternalQueue(true);
+      return queue;
    }
 
    private void createNewRecord(final long eventUID,
@@ -1255,6 +1293,11 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       @Override
       public Bridge getBridge() {
          return bridge;
+      }
+
+      @Override
+      public ServerLocator getTargetLocator() {
+         return targetLocator;
       }
 
       @Override
@@ -1801,14 +1844,7 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
             logger.debug("Node {} is already back in the topology after record removal; re-creating bridge", targetNodeID);
             try {
                SimpleString queueName = getSfQueueName(targetNodeID);
-               Binding queueBinding = postOffice.getBinding(queueName);
-               Queue queue;
-               if (queueBinding != null) {
-                  queue = (Queue) queueBinding.getBindable();
-               } else {
-                  queue = server.createQueue(QueueConfiguration.of(queueName).setRoutingType(RoutingType.MULTICAST).setAutoCreateAddress(true).setMaxConsumers(-1).setPurgeOnNoConsumers(false).setInternal(true));
-               }
-               queue.setInternalQueue(true);
+               Queue queue = getOrCreateSnFQueue(queueName);
                createNewRecord(member.getUniqueEventID(), targetNodeID, member.getPrimary(), queueName, queue, true);
             } catch (Exception e) {
                ActiveMQServerLogger.LOGGER.errorUpdatingTopology(e);
