@@ -68,6 +68,8 @@ public class RemoteQueueBindingImpl implements RemoteQueueBinding {
 
    private boolean connected = true;
 
+   private boolean routeEnabled = true;
+
    public RemoteQueueBindingImpl(final long id,
                                  final SimpleString address,
                                  final SimpleString uniqueName,
@@ -308,6 +310,17 @@ public class RemoteQueueBindingImpl implements RemoteQueueBinding {
    @Override
    public void connect() {
       connected = true;
+      routeEnabled = true;
+   }
+
+   @Override
+   public boolean isRouteEnabled() {
+      return routeEnabled;
+   }
+
+   @Override
+   public void setRouteEnabled(boolean routeEnabled) {
+      this.routeEnabled = routeEnabled;
    }
 
    public Set<Filter> getFilters() {

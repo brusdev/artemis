@@ -67,6 +67,7 @@ import org.apache.activemq.artemis.core.server.LargeServerMessage;
 import org.apache.activemq.artemis.core.server.MessageReference;
 import org.apache.activemq.artemis.core.server.Queue;
 import org.apache.activemq.artemis.core.server.cluster.Bridge;
+import org.apache.activemq.artemis.core.server.cluster.RemoteQueueBinding;
 import org.apache.activemq.artemis.core.server.impl.QueueImpl;
 import org.apache.activemq.artemis.core.server.management.Notification;
 import org.apache.activemq.artemis.core.server.management.NotificationService;
@@ -617,6 +618,8 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       }
 
       if (statusLock.tryLock()) {
+         ActiveMQException deferredConnectionFailure = null;
+         HandleStatus status = HandleStatus.BUSY;
          try {
             if (state != State.STARTED || !session.isWritable(this)) {
                if (logger.isDebugEnabled()) {
@@ -671,13 +674,16 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
                   server.callBrokerBridgePlugins(plugin -> plugin.beforeDeliverBridge(this, ref));
                }
 
-               final HandleStatus status;
                if (message.isLargeMessage()) {
                   deliveringLargeMessage = true;
                   deliverLargeMessage(dest, ref, (LargeServerMessage) message);
                   status = HandleStatus.HANDLED;
                } else {
-                  status = deliverStandardMessage(dest, ref, message, ref.getMessage());
+                  // Do not call connectionFailed while statusLock is held: fail() may take
+                  // recordsGuard, and nodeUP/removeRecord close bridges under that guard
+                  // by taking statusLock again.
+                  deferredConnectionFailure = deliverStandardMessage(dest, ref, message, ref.getMessage());
+                  status = deferredConnectionFailure == null ? HandleStatus.HANDLED : HandleStatus.BUSY;
                }
 
                //Only increment messages pending acknowledgement if handled by bridge
@@ -686,10 +692,9 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
                }
 
                if (server.hasBrokerBridgePlugins()) {
-                  server.callBrokerBridgePlugins(plugin -> plugin.afterDeliverBridge(this, ref, status));
+                  final HandleStatus pluginStatus = status;
+                  server.callBrokerBridgePlugins(plugin -> plugin.afterDeliverBridge(this, ref, pluginStatus));
                }
-
-               return status;
             } catch (Exception e) {
                // If an exception happened, we must count down immediately
                pendingAcks.countDown();
@@ -698,6 +703,12 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          } finally {
             statusLock.unlock();
          }
+
+         // After releasing statusLock so ClusterConnection recordsGuard work cannot deadlock.
+         if (deferredConnectionFailure != null) {
+            connectionFailed(deferredConnectionFailure, false);
+         }
+         return status;
       } else {
          return HandleStatus.BUSY;
       }
@@ -763,16 +774,35 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          if (logger.isDebugEnabled()) {
             logger.debug("Moving {} messages from {} to {}", queue.getMessageCount(), queue.getName(), scaleDownTargetNodeID);
          }
-         ((QueueImpl) queue).moveReferencesBetweenSnFQueues(SimpleString.of(scaleDownTargetNodeID));
-
-         // stop the bridge from trying to reconnect and clean up all the bindings
-         fail(true, true);
-
+         // Exclude this SnF from address routing before relocate so postOffice.route
+         // cannot bounce refs back here.  Scale-down means the peer is not coming back.
+         disableRoutingForSnFRemotes();
+         ((QueueImpl) queue).relocateSnFReferencesOnScaleDown(SimpleString.of(scaleDownTargetNodeID));
       } catch (Exception e) {
+         // Still fall through to fail(): skipping tear-down leaves a live record/bridge
+         // after the peer has scaled down.
          logger.warn(e.getMessage(), e);
       } finally {
          statusLock.unlock();
       }
+
+      // fail() must not run under statusLock: ClusterConnectionBridge.fail may take
+      // recordsGuard and then BridgeImpl.stop/flushExecutor (statusLock again).
+      fail(true, true);
+   }
+
+   private void disableRoutingForSnFRemotes() {
+      if (server == null || server.getPostOffice() == null || queue == null) {
+         return;
+      }
+      server.getPostOffice().getAllBindings().forEach(binding -> {
+         if (binding instanceof RemoteQueueBinding remoteQueueBinding && remoteQueueBinding.getQueue() == queue) {
+            remoteQueueBinding.setRouteEnabled(false);
+            if (logger.isDebugEnabled()) {
+               logger.debug("Disabled routeEnabled on {} for scale-down of SnF {}", remoteQueueBinding, queue.getName());
+            }
+         }
+      });
    }
 
    protected void tryScheduleRetryReconnect(final ActiveMQExceptionType type) {
@@ -809,7 +839,16 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       });
    }
 
-   private HandleStatus deliverStandardMessage(SimpleString dest, final MessageReference ref, Message message, Message originalMessage) {
+   /**
+    * Send a standard (non-large) message on the bridge session.
+    *
+    * @return {@code null} on success; the send failure to be handled by the caller
+    *         <em>after</em> releasing {@code statusLock} (see {@link #handle})
+    */
+   private ActiveMQException deliverStandardMessage(SimpleString dest,
+                                                    final MessageReference ref,
+                                                    Message message,
+                                                    Message originalMessage) {
       // if we failover during send then there is a chance that the
       // that this will throw a disconnect, we need to remove the message
       // from the acks so it will get resent, duplicate detection will cope
@@ -819,6 +858,7 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
 
       try {
          producer.send(dest, message);
+         return null;
       } catch (final ActiveMQException e) {
          ActiveMQServerLogger.LOGGER.bridgeUnableToSendMessage(ref, e);
 
@@ -831,14 +871,10 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
             ((QueueImpl) ref.getQueue()).decDelivering(ref);
          }
 
-         connectionFailed(e, false);
-
-         return HandleStatus.BUSY;
+         return e;
       } finally {
          originalMessage.usageDown();
       }
-
-      return HandleStatus.HANDLED;
    }
 
    /**
@@ -888,12 +924,26 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       return state;
    }
 
+   /**
+    * Whether this bridge should announce its target as down in the topology.
+    * <p>
+    * Cluster bridges override this so a delayed fail from a replaced (stale) bridge
+    * does not remove a peer that has already rejoined under a newer record.
+    */
+   protected boolean shouldNotifyNodeDown() {
+      return true;
+   }
+
    protected void fail(final boolean permanently, boolean scaleDown) {
       logger.debug("{}\n\t::fail being called, permanently={}", this, permanently);
       //we need to make sure we remove the node from the topology so any incoming quorum requests are voted correctly
       if (targetNodeID != null) {
          this.disconnectedAndDown = true;
-         serverLocator.notifyNodeDown(System.currentTimeMillis(), targetNodeID);
+         if (shouldNotifyNodeDown()) {
+            serverLocator.notifyNodeDown(System.currentTimeMillis(), targetNodeID);
+         } else if (logger.isDebugEnabled()) {
+            logger.debug("{}::skipping notifyNodeDown for {} (bridge no longer current)", this, targetNodeID);
+         }
       }
       if (queue != null) {
          try {

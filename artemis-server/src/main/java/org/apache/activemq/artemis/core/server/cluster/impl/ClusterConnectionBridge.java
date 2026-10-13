@@ -25,7 +25,6 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 
 import org.apache.activemq.artemis.api.config.ActiveMQDefaultConfiguration;
-import org.apache.activemq.artemis.api.core.ActiveMQAddressDoesNotExistException;
 import org.apache.activemq.artemis.api.core.ActiveMQException;
 import org.apache.activemq.artemis.api.core.ActiveMQExceptionType;
 import org.apache.activemq.artemis.api.core.Message;
@@ -53,7 +52,6 @@ import org.apache.activemq.artemis.core.server.ActiveMQServerLogger;
 import org.apache.activemq.artemis.core.server.ComponentConfigurationRoutingType;
 import org.apache.activemq.artemis.core.server.Queue;
 import org.apache.activemq.artemis.core.server.cluster.ActiveMQServerSideProtocolManagerFactory;
-import org.apache.activemq.artemis.core.server.cluster.ClusterConnection;
 import org.apache.activemq.artemis.core.server.cluster.ClusterManager;
 import org.apache.activemq.artemis.core.server.cluster.MessageFlowRecord;
 import org.apache.activemq.artemis.utils.CompositeAddress;
@@ -71,7 +69,7 @@ import java.lang.invoke.MethodHandles;
 public class ClusterConnectionBridge extends BridgeImpl {
    private static final Logger logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
 
-   private final ClusterConnection clusterConnection;
+   private final ClusterConnectionImpl clusterConnection;
 
    private final ClusterManager clusterManager;
 
@@ -94,7 +92,7 @@ public class ClusterConnectionBridge extends BridgeImpl {
 
    private final String storeAndForwardPrefix;
 
-   public ClusterConnectionBridge(final ClusterConnection clusterConnection,
+   public ClusterConnectionBridge(final ClusterConnectionImpl clusterConnection,
                                   final ClusterManager clusterManager,
                                   final ServerLocatorInternal targetLocator,
                                   final ServerLocatorInternal discoveryLocator,
@@ -427,28 +425,24 @@ public class ClusterConnectionBridge extends BridgeImpl {
    }
 
    @Override
+   protected boolean shouldNotifyNodeDown() {
+      // Only the live bridge for this node may announce a node-down.  A delayed fail
+      // from a replaced bridge must not wipe a newer rejoin (same node ID).
+      return clusterConnection.isCurrentRecord(targetNodeID, this);
+   }
+
+   @Override
    protected void fail(final boolean permanently, final boolean scaleDown) {
       logger.debug("Cluster Bridge {} failed, permanently={}", this.getName(), permanently);
       super.fail(permanently, scaleDown);
 
       if (permanently) {
          logger.debug("cluster node for bridge {} is permanently down", this.getName());
-         clusterConnection.removeRecord(targetNodeID);
-
-         if (scaleDown) {
-            executor.execute(() -> {
-               logger.debug("Scaling down queue {}", queue);
-               try {
-                  queue.deleteQueue(true);
-                  queue.removeAddress();
-               } catch (ActiveMQAddressDoesNotExistException e) {
-                  logger.debug("ActiveMQAddressDoesNotExistException during scale down for queue {}", queue);
-               } catch (Exception e) {
-                  logger.warn(e.getMessage(), e);
-               }
-            });
-         }
-      } else {
+         // Only tear down the record if this bridge is still the live record.
+         // Do not delete the SnF queue here (or deferred on this executor): a replacement
+         // may already have adopted it by name via getOrCreateSnFQueue.
+         clusterConnection.removeRecord(targetNodeID, this, scaleDown);
+      } else if (clusterConnection.isCurrentRecord(targetNodeID, this)) {
          clusterConnection.disconnectRecord(targetNodeID);
       }
    }

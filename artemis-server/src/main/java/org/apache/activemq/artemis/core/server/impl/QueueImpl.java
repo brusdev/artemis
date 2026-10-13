@@ -22,6 +22,7 @@ import java.io.StringWriter;
 import java.lang.invoke.MethodHandles;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -2567,11 +2568,11 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
       });
    }
 
-   public int moveReferencesBetweenSnFQueues(final SimpleString queueSuffix) throws Exception {
-      return iterQueue("moveReferencesBetweenSnFQueues", DEFAULT_FLUSH_LIMIT, null, new QueueIterateAction() {
+   public int relocateSnFReferencesOnScaleDown(final SimpleString queueSuffix) throws Exception {
+      return iterQueue("relocateSnFReferencesOnScaleDown", DEFAULT_FLUSH_LIMIT, null, new QueueIterateAction() {
          @Override
          public boolean actMessage(Transaction tx, MessageReference ref) throws Exception {
-            return moveBetweenSnFQueues(queueSuffix, tx, ref, null);
+            return relocateSnFReferenceOnScaleDown(queueSuffix, tx, ref, null);
          }
       });
    }
@@ -3502,56 +3503,73 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
    }
 
    @SuppressWarnings({"ArrayToString", "ArrayToStringConcatenation"})
-   private boolean moveBetweenSnFQueues(final SimpleString queueSuffix,
-                                        final Transaction tx,
-                                        final MessageReference ref,
-                                        final SimpleString newAddress) throws Exception {
+   private boolean relocateSnFReferenceOnScaleDown(final SimpleString queueSuffix,
+                                                   final Transaction tx,
+                                                   final MessageReference ref,
+                                                   final SimpleString newAddress) throws Exception {
       Message copyMessage = makeCopy(ref, false, false, newAddress);
 
       byte[] oldRouteToIDs = null;
-      String targetNodeID;
-      Binding targetBinding;
 
-      // remove the old route
-      for (SimpleString propName : copyMessage.getPropertyNames()) {
+      // remove the old route headers (retarget uses the IDs; postOffice.route must not see them)
+      for (SimpleString propName : new ArrayList<>(copyMessage.getPropertyNames())) {
          if (propName.startsWith(Message.HDR_ROUTE_TO_IDS)) {
-            oldRouteToIDs = (byte[]) copyMessage.removeProperty(propName.toString());
-
-            if (logger.isDebugEnabled()) {
-               final String hashcodeToString = oldRouteToIDs.toString(); // don't use Arrays.toString(..) here
-               logger.debug("Removed property from message: {} = {} ({})", propName, hashcodeToString, ByteBuffer.wrap(oldRouteToIDs).getLong());
+            if (oldRouteToIDs == null) {
+               oldRouteToIDs = (byte[]) copyMessage.removeProperty(propName.toString());
+               if (logger.isDebugEnabled() && oldRouteToIDs != null && oldRouteToIDs.length >= Long.BYTES) {
+                  final String hashcodeToString = oldRouteToIDs.toString(); // don't use Arrays.toString(..) here
+                  logger.debug("Removed property from message: {} = {} ({})", propName, hashcodeToString, ByteBuffer.wrap(oldRouteToIDs).getLong());
+               }
+            } else {
+               copyMessage.removeProperty(propName.toString());
             }
-
-            // there should only be one of these properties so potentially save some loop iterations
-            break;
          }
       }
 
-      ByteBuffer oldBuffer = ByteBuffer.wrap(oldRouteToIDs);
+      boolean placed = false;
 
-      RoutingContext routingContext = new RoutingContextImpl(tx);
+      if (oldRouteToIDs != null && oldRouteToIDs.length > 0) {
+         ByteBuffer oldBuffer = ByteBuffer.wrap(oldRouteToIDs);
+         RoutingContext routingContext = new RoutingContextImpl(tx);
 
-      /*
-       * this algorithm will look at the old route and find the new remote queue bindings where the messages should go
-       * and route them there directly
-       */
-      while (oldBuffer.hasRemaining()) {
-         long oldQueueID = oldBuffer.getLong();
+         /*
+          * Prefer a remote binding on the scale-down target with the same routing name as
+          * each old remote queue ID.  Remotes for this SnF have routeEnabled=false already;
+          * that does not affect this direct binding lookup.
+          */
+         while (oldBuffer.hasRemaining()) {
+            long oldQueueID = oldBuffer.getLong();
+            Pair<String, Binding> result = locateScaleDownTargetBinding(queueSuffix, copyMessage, oldQueueID);
+            Binding targetBinding = result.getB();
+            String targetNodeID = result.getA();
 
-         // look at all the bindings
-         Pair<String, Binding> result = locateTargetBinding(queueSuffix, copyMessage, oldQueueID);
-         targetBinding = result.getB();
-         targetNodeID = result.getA();
+            if (targetBinding == null) {
+               ActiveMQServerLogger.LOGGER.unableToFindTargetQueue(targetNodeID);
+            } else {
+               logger.debug("Routing on binding: {}", targetBinding);
+               targetBinding.route(copyMessage, routingContext);
+               placed = true;
+            }
+         }
 
-         if (targetBinding == null) {
-            ActiveMQServerLogger.LOGGER.unableToFindTargetQueue(targetNodeID);
-         } else {
-            logger.debug("Routing on binding: {}", targetBinding);
-            targetBinding.route(copyMessage, routingContext);
+         if (placed) {
+            postOffice.processRoute(copyMessage, routingContext, false);
          }
       }
 
-      postOffice.processRoute(copyMessage, routingContext, false);
+      if (!placed) {
+         // Scale-down: peer is not coming back.  Re-route via the address (local / other
+         // SnFs).  Remotes for this SnF are routeEnabled=false so we cannot bounce here.
+         // NO_BINDINGS / DLA still ack the SnF ref (same as an unroutable send).
+         if (logger.isDebugEnabled()) {
+            logger.debug("Falling back to postOffice.route for SnF ref {} on {} (scale-down target {})",
+                         ref, queueConfiguration.getName(), queueSuffix);
+         }
+         RoutingStatus status = postOffice.route(copyMessage, tx, false);
+         if (logger.isDebugEnabled()) {
+            logger.debug("postOffice.route status={} for message {} from SnF {}", status, copyMessage, queueConfiguration.getName());
+         }
+      }
 
       ref.handled();
 
@@ -3573,48 +3591,49 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
       return true;
    }
 
-   private Pair<String, Binding> locateTargetBinding(SimpleString queueSuffix, Message copyMessage, long oldQueueID) {
-      String targetNodeID = null;
-      Binding targetBinding = null;
+   private Pair<String, Binding> locateScaleDownTargetBinding(SimpleString queueSuffix, Message copyMessage, long oldQueueID) {
+      SimpleString routingName = null;
+      String previousNodeID = null;
 
-      // we only care about the remote queue bindings
+      // Resolve the logical queue from the old remote queue ID still present on a RemoteQueueBinding.
       for (RemoteQueueBinding remoteQueueBinding : iterableOf(postOffice.getAllBindings()
                                                                  .filter(RemoteQueueBinding.class::isInstance)
                                                                  .map(RemoteQueueBinding.class::cast))) {
-         // does this remote queue binding point to the same queue as the message?
          if (oldQueueID == remoteQueueBinding.getRemoteQueueID()) {
-            // get the name of this queue so we can find the corresponding remote queue binding pointing to the scale down target node
-            SimpleString oldQueueName = remoteQueueBinding.getRoutingName();
-
-            // parse the queue name of the remote queue binding to determine the node ID
-            String temp = remoteQueueBinding.getQueue().getName().toString();
-            targetNodeID = temp.substring(temp.lastIndexOf(".") + 1);
+            routingName = remoteQueueBinding.getRoutingName();
+            String snfName = remoteQueueBinding.getQueue().getName().toString();
+            previousNodeID = snfName.substring(snfName.lastIndexOf(".") + 1);
 
             if (logger.isDebugEnabled()) {
-               logger.debug("Message formerly destined for {} with ID: {} on address {} on node {}", oldQueueName, oldQueueID, copyMessage.getAddressSimpleString(), targetNodeID);
+               logger.debug("Message formerly destined for {} with ID: {} on address {} on node {}",
+                            routingName, oldQueueID, copyMessage.getAddressSimpleString(), previousNodeID);
             }
-
-            // now that we have the name of the queue we need to look through all the bindings again to find the new remote queue binding
-            // again, we only care about the remote queue bindings
-            for (RemoteQueueBinding innerRemoteQueueBinding : iterableOf(postOffice.getAllBindings()
-                                                                            .filter(RemoteQueueBinding.class::isInstance)
-                                                                            .map(RemoteQueueBinding.class::cast))) {
-               temp = innerRemoteQueueBinding.getQueue().getName().toString();
-               targetNodeID = temp.substring(temp.lastIndexOf(".") + 1);
-               if (oldQueueName.equals(innerRemoteQueueBinding.getRoutingName()) && targetNodeID.equals(queueSuffix.toString())) {
-                  targetBinding = innerRemoteQueueBinding;
-                  if (logger.isDebugEnabled()) {
-                     logger.debug("Message now destined for {} with ID: {} on address {} on node {}",
-                                  innerRemoteQueueBinding.getRoutingName(), innerRemoteQueueBinding.getRemoteQueueID(), copyMessage.getAddress(), targetNodeID);
-                  }
-                  break;
-               } else {
-                  logger.debug("Failed to match: {}", innerRemoteQueueBinding);
-               }
-            }
+            break;
          }
       }
-      return new Pair<>(targetNodeID, targetBinding);
+
+      if (routingName == null) {
+         return new Pair<>(previousNodeID, null);
+      }
+
+      for (RemoteQueueBinding remoteQueueBinding : iterableOf(postOffice.getAllBindings()
+                                                                 .filter(RemoteQueueBinding.class::isInstance)
+                                                                 .map(RemoteQueueBinding.class::cast))) {
+         String snfName = remoteQueueBinding.getQueue().getName().toString();
+         String nodeID = snfName.substring(snfName.lastIndexOf(".") + 1);
+         if (routingName.equals(remoteQueueBinding.getRoutingName()) && nodeID.equals(queueSuffix.toString())) {
+            if (logger.isDebugEnabled()) {
+               logger.debug("Message now destined for {} with ID: {} on address {} on node {}",
+                            remoteQueueBinding.getRoutingName(), remoteQueueBinding.getRemoteQueueID(),
+                            copyMessage.getAddress(), nodeID);
+            }
+            return new Pair<>(nodeID, remoteQueueBinding);
+         } else {
+            logger.debug("Failed to match: {}", remoteQueueBinding);
+         }
+      }
+
+      return new Pair<>(queueSuffix.toString(), null);
    }
 
    private Message makeCopy(final MessageReference ref, final boolean expiry, final SimpleString newAddress) throws Exception {

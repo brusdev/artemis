@@ -65,6 +65,18 @@ public class BindingsImplTest extends ActiveMQTestBase {
    }
 
    @Test
+   public void testGetNextBindingSkipsRouteDisabledRemote() throws Exception {
+      final FakeRemoteBinding fake = new FakeRemoteBinding(SimpleString.of("a"));
+      fake.filter = null;
+      fake.messageLoadBalancingType = MessageLoadBalancingType.ON_DEMAND;
+      fake.routeEnabled = false;
+      final Bindings bind = new BindingsImpl(null, null, new NullStorageManager(1000));
+      bind.addBinding(fake);
+      bind.route(new CoreMessage(0, 100), new RoutingContextImpl(new FakeTransaction()));
+      assertEquals(0, fake.routedCount.get());
+   }
+
+   @Test
    public void testGetNextBindingWithLoadBalancingOff() throws Exception {
       final FakeRemoteBinding fake = new FakeRemoteBinding(SimpleString.of("a"));
       fake.filter = null;  // such that it wil match all messages
@@ -432,6 +444,8 @@ public class BindingsImplTest extends ActiveMQTestBase {
 
    private final class FakeRemoteBinding extends FakeBinding implements RemoteQueueBinding {
       MessageLoadBalancingType messageLoadBalancingType;
+      boolean routeEnabled = true;
+
       FakeRemoteBinding(SimpleString name) {
          super(name);
       }
@@ -470,6 +484,17 @@ public class BindingsImplTest extends ActiveMQTestBase {
 
       @Override
       public void connect() {
+         routeEnabled = true;
+      }
+
+      @Override
+      public boolean isRouteEnabled() {
+         return routeEnabled;
+      }
+
+      @Override
+      public void setRouteEnabled(boolean routeEnabled) {
+         this.routeEnabled = routeEnabled;
       }
 
       @Override

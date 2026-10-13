@@ -55,6 +55,8 @@ public class PrimaryOnlyActivation extends Activation {
 
    private ClientSessionFactoryInternal scaleDownClientSessionFactory;
 
+   private volatile String scaleDownTargetNodeId;
+
    public PrimaryOnlyActivation(ActiveMQServerImpl server, PrimaryOnlyPolicy primaryOnlyPolicy) {
       this.activeMQServer = server;
       this.primaryOnlyPolicy = primaryOnlyPolicy;
@@ -98,6 +100,7 @@ public class PrimaryOnlyActivation extends Activation {
 
    @Override
    public void close(boolean permanently, boolean restarting) throws Exception {
+      scaleDownTargetNodeId = null;
       if (scaleDownServerLocator != null) {
          scaleDownServerLocator.close();
          scaleDownServerLocator = null;
@@ -122,11 +125,31 @@ public class PrimaryOnlyActivation extends Activation {
          connectToScaleDownTarget(primaryOnlyPolicy.getScaleDownPolicy());
       }
 
-      RemotingConnection rc = scaleDownClientSessionFactory == null ? null : scaleDownClientSessionFactory.getConnection();
-      String nodeID = rc == null ? null : scaleDownClientSessionFactory.getServerLocator().getTopology().getMember(rc).getNodeId();
       if (remotingService != null) {
-         remotingService.freeze(nodeID, null);
+         remotingService.freeze(resolveScaleDownTargetNodeId(), null);
       }
+   }
+
+   /**
+    * Prefer the id captured while connecting; fall back to a single topology lookup so
+    * freeze can send a scale-down disconnect rather than a bare DISCONNECTED.
+    */
+   private String resolveScaleDownTargetNodeId() {
+      if (scaleDownTargetNodeId != null) {
+         return scaleDownTargetNodeId;
+      }
+      if (scaleDownClientSessionFactory == null) {
+         return null;
+      }
+      RemotingConnection rc = scaleDownClientSessionFactory.getConnection();
+      if (rc == null) {
+         return null;
+      }
+      var member = scaleDownClientSessionFactory.getServerLocator().getTopology().getMember(rc);
+      if (member != null) {
+         scaleDownTargetNodeId = member.getNodeId();
+      }
+      return scaleDownTargetNodeId;
    }
 
    @Override
@@ -190,6 +213,7 @@ public class PrimaryOnlyActivation extends Activation {
          }
          if (clientSessionFactory != null) {
             scaleDownClientSessionFactory = clientSessionFactory;
+            scaleDownTargetNodeId = nodeLocator.getNodeID();
          } else {
             throw new ActiveMQException("Unable to connect to server for scale-down");
          }

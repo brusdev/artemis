@@ -969,6 +969,18 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
          return;
       }
 
+      // Close/flush of a dead record must happen OUTSIDE recordsGuard.  record.close()
+      // → BridgeImpl.stop() acquires the bridge statusLock; a deliverer may already hold
+      // that lock while calling isCurrentRecord/removeRecord (which need recordsGuard).
+      // Holding recordsGuard across close() deadlocks those two lock orders.
+      //
+      // Also close the dead record BEFORE creating its replacement: otherwise the new
+      // bridge's BINDING_ADDED can see the old RemoteQueueBinding still in the PostOffice
+      // and skip installing it into the new flow record's map, after which CONSUMER_CREATED
+      // fails with "Cannot find binding".
+      MessageFlowRecord deadRecord = null;
+      Bridge deadBridge = null;
+      boolean createAfterClose = false;
       synchronized (recordsGuard) {
          try {
             MessageFlowRecord record = records.get(nodeID);
@@ -981,32 +993,80 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
                // New node - create a new flow record
 
                final SimpleString queueName = getSfQueueName(nodeID);
-
-               Binding queueBinding = postOffice.getBinding(queueName);
-
-               Queue queue;
-
-               if (queueBinding != null) {
-                  queue = (Queue) queueBinding.getBindable();
-               } else {
-                  // Add binding in storage so the queue will get reloaded on startup and we can find it - it's never
-                  // actually routed to at that address though
-                  queue = server.createQueue(QueueConfiguration.of(queueName).setRoutingType(RoutingType.MULTICAST).setAutoCreateAddress(true).setMaxConsumers(-1).setPurgeOnNoConsumers(false).setInternal(true));
-               }
-
-               // There are a few things that will behave differently when it's an internal queue
-               // such as we don't hold groupIDs inside the SnF queue
-               queue.setInternalQueue(true);
+               Queue queue = getOrCreateSnFQueue(queueName);
 
                createNewRecord(topologyMember.getUniqueEventID(), nodeID, topologyMember.getPrimary(), queueName, queue, true);
             } else {
-               if (logger.isTraceEnabled()) {
-                  logger.trace("{} ignored nodeUp record for {} on nodeID={} as the record already existed", this, topologyMember, nodeID);
+               // A record can be left in a dead state when createNewRecord() raced with a
+               // concurrent shutdown: the bridge was instantiated but its ServerLocator was
+               // closed before the first connection attempt succeeded (AMQ222100).  In that
+               // case the record is non-null but the bridge will never become connected on
+               // its own.  Detect this precisely by checking isClosed() (explicit teardown)
+               // or whether the record's targetLocator has been closed (AMQ222100 scenario).
+               // We must NOT use !bridge.isConnected() alone because a brand-new replacement
+               // bridge that has just been started is also not yet connected, which would
+               // cause a second nodeUP to immediately replace the live replacement record.
+               Bridge existingBridge = record.getBridge();
+               boolean locatorClosed = isBridgeLocatorClosed(existingBridge);
+               boolean bridgeDead = record.isClosed() ||
+                                    existingBridge == null ||
+                                    locatorClosed;
+               if (bridgeDead) {
+                  if (logger.isDebugEnabled()) {
+                     logger.debug("{}::Dead record detected for nodeID={} (isClosed={}, locatorClosed={}, bridgeConnected={}). Replacing with a new record.",
+                                  this, nodeID, record.isClosed(), locatorClosed,
+                                  existingBridge != null && existingBridge.isConnected());
+                  }
+                  // Remove from the map first so isCurrentRecord/removeRecord from the
+                  // dying bridge see it as non-current before we block on its statusLock.
+                  records.remove(nodeID);
+                  deadRecord = record;
+                  deadBridge = existingBridge;
+                  createAfterClose = true;
+               } else {
+                  if (logger.isTraceEnabled()) {
+                     logger.trace("{} ignored nodeUp record for {} on nodeID={} as the record already existed", this, topologyMember, nodeID);
+                  }
                }
             }
          } catch (Exception e) {
             ActiveMQServerLogger.LOGGER.errorUpdatingTopology(e);
          }
+      }
+      closeRecordAndFlush(deadRecord, deadBridge, nodeID);
+      if (createAfterClose) {
+         synchronized (recordsGuard) {
+            try {
+               if (!stopping && !records.containsKey(nodeID)) {
+                  final SimpleString queueName = getSfQueueName(nodeID);
+                  Queue queue = getOrCreateSnFQueue(queueName);
+                  createNewRecord(topologyMember.getUniqueEventID(), nodeID, topologyMember.getPrimary(), queueName, queue, true);
+               }
+            } catch (Exception e) {
+               ActiveMQServerLogger.LOGGER.errorUpdatingTopology(e);
+            }
+         }
+      }
+   }
+
+   /**
+    * Tear down a removed flow record without holding {@link #recordsGuard}.
+    * <p>
+    * {@link MessageFlowRecord#close()} eventually takes the bridge {@code statusLock};
+    * holding {@code recordsGuard} across that call deadlocks with deliverers that hold
+    * {@code statusLock} and then call {@link #isCurrentRecord}/{@link #removeRecord}.
+    */
+   private void closeRecordAndFlush(MessageFlowRecord record, Bridge bridge, String nodeID) {
+      if (record == null) {
+         return;
+      }
+      try {
+         record.close();
+      } catch (Exception ignored) {
+         logger.debug("Error closing record for nodeID={}", nodeID, ignored);
+      }
+      if (bridge != null) {
+         bridge.flushExecutor();
       }
    }
 
@@ -1041,6 +1101,28 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
    public BridgeMetrics getBridgeMetrics(String nodeId) {
       final MessageFlowRecord record = records.get(nodeId);
       return record != null && record.getBridge() != null ? record.getBridge().getMetrics() : null;
+   }
+
+   private static boolean isBridgeLocatorClosed(Bridge bridge) {
+      return bridge instanceof BridgeImpl bi &&
+         bi.getServerLocator() != null &&
+         bi.getServerLocator().isClosed();
+   }
+
+   private Queue getOrCreateSnFQueue(final SimpleString queueName) throws Exception {
+      Binding queueBinding = postOffice.getBinding(queueName);
+      Queue queue;
+      if (queueBinding != null) {
+         queue = (Queue) queueBinding.getBindable();
+      } else {
+         // Add binding in storage so the queue will get reloaded on startup and we can find it - it's never
+         // actually routed to at that address though
+         queue = server.createQueue(QueueConfiguration.of(queueName).setRoutingType(RoutingType.MULTICAST).setAutoCreateAddress(true).setMaxConsumers(-1).setPurgeOnNoConsumers(false).setInternal(true));
+      }
+      // There are a few things that will behave differently when it's an internal queue
+      // such as we don't hold groupIDs inside the SnF queue
+      queue.setInternalQueue(true);
+      return queue;
    }
 
    private void createNewRecord(final long eventUID,
@@ -1101,7 +1183,7 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       targetLocator.addIncomingInterceptor(new IncomingInterceptorLookingForExceptionMessage(manager, executorFactory.getExecutor()));
       MessageFlowRecordImpl record = new MessageFlowRecordImpl(targetLocator, eventUID, targetNodeID, connector, queueName, queue);
 
-      ClusterConnectionBridge bridge = new ClusterConnectionBridge(this, manager, targetLocator, serverLocator, initialConnectAttempts, reconnectAttempts, retryInterval, retryIntervalMultiplier, maxRetryInterval, nodeManager.getUUID(), record.getEventUID(), record.getTargetNodeID(), record.getQueueName(), record.getQueue(), executorFactory.getExecutor(), null, null, scheduledExecutor, null, useDuplicateDetection, clusterUser, clusterPassword, server, managementService.getManagementAddress(), managementService.getManagementNotificationAddress(), record, record.getConnector(), storeAndForwardPrefix, server.getStorageManager(), clientId);
+      ClusterConnectionBridge bridge = new ClusterConnectionBridge(this, manager, targetLocator, serverLocator, initialConnectAttempts, reconnectAttempts, retryInterval, retryIntervalMultiplier, maxRetryInterval, nodeManager.getUUID(), eventUID, targetNodeID, queueName, queue, executorFactory.getExecutor(), null, null, scheduledExecutor, null, useDuplicateDetection, clusterUser, clusterPassword, server, managementService.getManagementAddress(), managementService.getManagementNotificationAddress(), record, connector, storeAndForwardPrefix, server.getStorageManager(), clientId);
 
       targetLocator.setIdentity("(Cluster-connection-bridge::" + bridge.toString() + "::" + this.toString() + ")");
 
@@ -1244,7 +1326,12 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       }
 
       @Override
-      public void reset() throws Exception {
+      public synchronized void reset() throws Exception {
+         // Gate live notifications until the fresh sendQueueInfoToQueue dump's
+         // HDR_RESET_QUEUE_DATA arrives.  Without this, a reconnect that rebuilds the
+         // notification consumer while reset is still true can apply CONSUMER_CREATED
+         // before BINDING_ADDED and throw "Cannot find binding".
+         reset = false;
          resetBindings();
       }
 
@@ -1497,15 +1584,18 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
          if (existingBinding != null) {
             if (queueID.equals(existingBinding.getRemoteQueueID())) {
+               // Always track it on this flow record so subsequent CONSUMER_* notifications
+               // can resolve the binding even when the PostOffice already had it (e.g. a
+               // previous record's binding not yet cleared, or a reconnect of the same bridge).
+               bindings.put(clusterName, existingBinding);
                if (!existingBinding.isConnected()) {
                   existingBinding.connect();
-                  return;
+               } else {
+                  // Sanity check - this means the binding has already been added via another bridge, probably max
+                  // hops is too high
+                  // or there are multiple cluster connections for the same address
+                  ActiveMQServerLogger.LOGGER.remoteQueueAlreadyBoundOnClusterConnection(this, clusterName);
                }
-               // Sanity check - this means the binding has already been added via another bridge, probably max
-               // hops is too high
-               // or there are multiple cluster connections for the same address
-
-               ActiveMQServerLogger.LOGGER.remoteQueueAlreadyBoundOnClusterConnection(this, clusterName);
                return;
             }
             //this could happen during jms non-durable failover while the qname doesn't change but qid
@@ -1597,16 +1687,18 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
          SimpleString clusterName = message.getSimpleStringProperty(ManagementHelper.HDR_CLUSTER_NAME);
 
-         message.putIntProperty(ManagementHelper.HDR_DISTANCE, distance + 1);
-
          SimpleString filterString = message.getSimpleStringProperty(ManagementHelper.HDR_FILTERSTRING);
 
          RemoteQueueBinding binding = bindings.get(clusterName);
 
          if (binding == null) {
-            throw new IllegalStateException("Cannot find binding for " + clusterName +
-                                               " on " +
-                                               ClusterConnectionImpl.this);
+            // With reset=false on reset(), live notifications are gated until BINDING_ADDED
+            // from the dump. A stray create before the binding is known is safe to ignore.
+            if (logger.isDebugEnabled()) {
+               logger.debug("{} ignoring CONSUMER_CREATED for missing binding {}",
+                  ClusterConnectionImpl.this, clusterName);
+            }
+            return;
          }
 
          binding.addConsumer(filterString);
@@ -1652,14 +1744,18 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
          SimpleString clusterName = message.getSimpleStringProperty(ManagementHelper.HDR_CLUSTER_NAME);
 
-         message.putIntProperty(ManagementHelper.HDR_DISTANCE, distance + 1);
-
          SimpleString filterString = message.getSimpleStringProperty(ManagementHelper.HDR_FILTERSTRING);
 
          RemoteQueueBinding binding = bindings.get(clusterName);
 
          if (binding == null) {
-            throw new IllegalStateException("Cannot find binding for " + clusterName);
+            // Stale close before the binding is known: ignore; the dump's consumer
+            // snapshot is authoritative after HDR_RESET_QUEUE_DATA.
+            if (logger.isDebugEnabled()) {
+               logger.debug("{} ignoring CONSUMER_CLOSED for missing binding {}",
+                  ClusterConnectionImpl.this, clusterName);
+            }
+            return;
          }
 
          binding.removeConsumer(filterString);
@@ -1775,46 +1871,87 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
    @Override
    public void removeRecord(String targetNodeID) {
+      removeRecord(targetNodeID, null, false);
+   }
+
+   public boolean isCurrentRecord(String targetNodeID, Bridge bridge) {
       synchronized (recordsGuard) {
-         logger.debug("Removing record for: {}", targetNodeID);
-         MessageFlowRecord record = records.remove(targetNodeID);
-         Bridge oldBridge = null;
-         try {
-            if (record != null) {
-               oldBridge = record.getBridge();
-               record.close();
+         MessageFlowRecord record = records.get(targetNodeID);
+         return record != null && record.getBridge() == bridge;
+      }
+   }
+
+   public boolean removeRecord(String targetNodeID, Bridge expectedBridge) {
+      return removeRecord(targetNodeID, expectedBridge, false);
+   }
+
+   /**
+    * Remove the flow record for {@code targetNodeID}.
+    * <p>
+    * {@code scaleDown} is accepted for API clarity at the call site; the SnF queue is
+    * intentionally <em>not</em> deleted here.  The previous deferred
+    * {@code queue.deleteQueue(true)} from {@link ClusterConnectionBridge#fail} raced with
+    * {@link #getOrCreateSnFQueue}: a replacement bridge could adopt the same {@link Queue}
+    * by name, then the deferred delete wiped in-flight messages and disconnected the new
+    * bridge with no reconnect path.  On restart the peer keeps the same node ID, so the
+    * SnF queue is reused; leaving it in place is correct for non-scale-down reconnect.
+    * On scale-down, {@code relocateSnFReferencesOnScaleDown} retargets to the scale-down
+    * node or re-routes via {@code postOffice.route} (never leave-on-SnF: the peer announced
+    * it is not coming back).
+    */
+   public boolean removeRecord(String targetNodeID, Bridge expectedBridge, boolean scaleDown) {
+      MessageFlowRecord removed;
+      Bridge oldBridge;
+      synchronized (recordsGuard) {
+         MessageFlowRecord record = records.get(targetNodeID);
+         if (record == null) {
+            return false;
+         }
+         // A delayed fail from an old bridge must not tear down a replacement created
+         // after the peer rejoined (same node ID, newer MessageFlowRecord / bridge).
+         if (expectedBridge != null && record.getBridge() != expectedBridge) {
+            if (logger.isDebugEnabled()) {
+               logger.debug("Skipping removeRecord for {}: current bridge was replaced", targetNodeID);
             }
-         } catch (Exception e) {
-            ActiveMQServerLogger.LOGGER.failedToRemoveRecord(e);
+            return false;
          }
 
-         // record.close() schedules async cleanup (StopRunnable + locator close) on the
-         // old bridge's executor.  Flush it so the old bridge is fully torn down before
-         // we potentially create a replacement — otherwise the async close can race with
-         // the new bridge's connection attempt.
-         if (oldBridge != null) {
-            oldBridge.flushExecutor();
-         }
+         logger.debug("Removing record for: {} (scaleDown={})", targetNodeID, scaleDown);
+         records.remove(targetNodeID);
+         removed = record;
+         oldBridge = record.getBridge();
+      }
 
+      // Close/flush outside recordsGuard — see closeRecordAndFlush / nodeUP.
+      // record.close() schedules async cleanup (StopRunnable + locator close) on the
+      // old bridge's executor.  Flush it so the old bridge is fully torn down before
+      // we potentially create a replacement — otherwise the async close can race with
+      // the new bridge's connection attempt.
+      try {
+         removed.close();
+      } catch (Exception e) {
+         ActiveMQServerLogger.LOGGER.failedToRemoveRecord(e);
+      }
+      if (oldBridge != null) {
+         oldBridge.flushExecutor();
+      }
+
+      synchronized (recordsGuard) {
          TopologyMemberImpl member = topology.getMember(targetNodeID);
-         if (member != null && member.getPrimary() != null && !stopping) {
+         // Only re-create if nothing else (e.g. a concurrent nodeUP) already installed
+         // a replacement while we were closing the old bridge.
+         if (member != null && member.getPrimary() != null && !stopping && !records.containsKey(targetNodeID)) {
             logger.debug("Node {} is already back in the topology after record removal; re-creating bridge", targetNodeID);
             try {
                SimpleString queueName = getSfQueueName(targetNodeID);
-               Binding queueBinding = postOffice.getBinding(queueName);
-               Queue queue;
-               if (queueBinding != null) {
-                  queue = (Queue) queueBinding.getBindable();
-               } else {
-                  queue = server.createQueue(QueueConfiguration.of(queueName).setRoutingType(RoutingType.MULTICAST).setAutoCreateAddress(true).setMaxConsumers(-1).setPurgeOnNoConsumers(false).setInternal(true));
-               }
-               queue.setInternalQueue(true);
+               Queue queue = getOrCreateSnFQueue(queueName);
                createNewRecord(member.getUniqueEventID(), targetNodeID, member.getPrimary(), queueName, queue, true);
             } catch (Exception e) {
                ActiveMQServerLogger.LOGGER.errorUpdatingTopology(e);
             }
          }
       }
+      return true;
    }
 
    @Override

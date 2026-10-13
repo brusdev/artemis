@@ -297,10 +297,16 @@ public class ScaleDownHandler {
                   }
                }
 
-               // TODO: what if oldRouteToIDs == null ??
-
                for (SimpleString propertyToRemove : propertiesToRemove) {
                   message.removeProperty(propertyToRemove.toString());
+               }
+
+               // Without route headers the target cannot place the message in the intended
+               // queues; acknowledging here would drop it.  Leave it on this SnF queue so a
+               // same-node-ID restart can still drain it (primary-only + scale-down).
+               if (oldRouteToIDs == null || oldRouteToIDs.length == 0) {
+                  ActiveMQServerLogger.LOGGER.unableToFindTargetQueue(targetNodeId);
+                  continue;
                }
 
                if (queueOnTarget) {

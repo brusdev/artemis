@@ -33,6 +33,15 @@ public interface RemoteQueueBinding extends QueueBinding {
 
    void connect();
 
+   /**
+    * When {@code false}, address routing must not select this binding (hard exclude).
+    * Used during scale-down so {@code postOffice.route} cannot re-enqueue onto this
+    * binding's store-and-forward queue. Independent of {@link #isConnected()}.
+    */
+   boolean isRouteEnabled();
+
+   void setRouteEnabled(boolean routeEnabled);
+
    long getRemoteQueueID();
 
    void setFilter(Filter filter);

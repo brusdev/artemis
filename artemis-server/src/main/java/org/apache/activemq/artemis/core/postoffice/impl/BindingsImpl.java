@@ -270,6 +270,9 @@ public final class BindingsImpl implements Bindings {
          nextPosition = moveNextPosition(nextPosition, bindingsCount);
          final Filter filter = binding.getFilter();
          final boolean highPrior = binding.isHighAcceptPriority(message);
+         if (binding instanceof RemoteQueueBinding remoteQueueBinding && !remoteQueueBinding.isRouteEnabled()) {
+            continue;
+         }
          if (highPrior && binding.getBindable() != originatingQueue && (filter == null || filter.match(message))) {
             nextBinding = binding;
             break;
@@ -479,6 +482,10 @@ public final class BindingsImpl implements Bindings {
    private static boolean matchBinding(final Message message,
                                        final Binding binding,
                                        final MessageLoadBalancingType loadBalancingType) {
+      if (binding instanceof RemoteQueueBinding remoteQueueBinding && !remoteQueueBinding.isRouteEnabled()) {
+         return false;
+      }
+
       if (loadBalancingType.equals(MessageLoadBalancingType.OFF) || loadBalancingType.equals(MessageLoadBalancingType.OFF_WITH_REDISTRIBUTION)) {
          if (!Objects.equals(message.getRoutingType(), RoutingType.MULTICAST) && binding instanceof RemoteQueueBinding) {
             return false;
