@@ -760,10 +760,27 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
    protected void scaleDown(String scaleDownTargetNodeID) {
       statusLock.lock();
       try {
+         beforeScaleDownRelocate();
          if (logger.isDebugEnabled()) {
             logger.debug("Moving {} messages from {} to {}", queue.getMessageCount(), queue.getName(), scaleDownTargetNodeID);
          }
-         ((QueueImpl) queue).moveReferencesBetweenSnFQueues(SimpleString.of(scaleDownTargetNodeID));
+         final QueueImpl snf = (QueueImpl) queue;
+         final SimpleString targetSuffix = SimpleString.of(scaleDownTargetNodeID);
+         int iteration = 0;
+         while (iteration < MAX_SCALE_DOWN_DRAIN_ITERATIONS && !snf.isEmptyForScaleDown()) {
+            iteration++;
+            int moved = snf.moveReferencesBetweenSnFQueues(targetSuffix);
+            logger.debug("scale-down drain iteration={} queue={} moved={} empty={}",
+                         iteration, snf.getName(), moved, snf.isEmptyForScaleDown());
+         }
+
+         if (!snf.isEmptyForScaleDown()) {
+            ActiveMQServerLogger.LOGGER.scaleDownDrainIncomplete(
+               MAX_SCALE_DOWN_DRAIN_ITERATIONS, snf.getName().toString(), snf.getMessageCount());
+            // Permanent fail without SnF delete so residual messages are retained
+            fail(true, false);
+            return;
+         }
 
          // stop the bridge from trying to reconnect and clean up all the bindings
          fail(true, true);
@@ -774,6 +791,14 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          statusLock.unlock();
       }
    }
+
+   /**
+    * Hook for cluster bridges to fence departing remote bindings before SnF relocate.
+    */
+   protected void beforeScaleDownRelocate() {
+   }
+
+   private static final int MAX_SCALE_DOWN_DRAIN_ITERATIONS = 10;
 
    protected void tryScheduleRetryReconnect(final ActiveMQExceptionType type) {
       scheduleRetryConnect();

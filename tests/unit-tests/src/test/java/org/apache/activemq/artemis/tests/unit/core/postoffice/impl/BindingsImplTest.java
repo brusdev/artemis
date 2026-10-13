@@ -473,6 +473,16 @@ public class BindingsImplTest extends ActiveMQTestBase {
       }
 
       @Override
+      public boolean isEnabled() {
+         return true;
+      }
+
+      @Override
+      public void setEnabled(boolean enabled) {
+
+      }
+
+      @Override
       public long getRemoteQueueID() {
          return 0;
       }

@@ -53,6 +53,7 @@ import org.apache.activemq.artemis.core.server.ActiveMQServerLogger;
 import org.apache.activemq.artemis.core.server.ComponentConfigurationRoutingType;
 import org.apache.activemq.artemis.core.server.Queue;
 import org.apache.activemq.artemis.core.server.cluster.ActiveMQServerSideProtocolManagerFactory;
+import org.apache.activemq.artemis.core.server.impl.QueueImpl;
 import org.apache.activemq.artemis.core.server.cluster.ClusterConnection;
 import org.apache.activemq.artemis.core.server.cluster.ClusterManager;
 import org.apache.activemq.artemis.core.server.cluster.MessageFlowRecord;
@@ -427,6 +428,13 @@ public class ClusterConnectionBridge extends BridgeImpl {
    }
 
    @Override
+   protected void beforeScaleDownRelocate() {
+      if (flowRecord != null) {
+         flowRecord.setBindingsEnabled(false);
+      }
+   }
+
+   @Override
    protected boolean shouldNotifyNodeDownOnFail() {
       return targetNodeID != null && clusterConnection.isCurrentBridge(targetNodeID, this);
    }
@@ -457,6 +465,11 @@ public class ClusterConnectionBridge extends BridgeImpl {
                      logger.debug("Skipping SnF delete for {}; a live flow record exists again", nodeId);
                      return;
                   }
+               }
+               if (snfQueue instanceof QueueImpl qi && !qi.isEmptyForScaleDown()) {
+                  ActiveMQServerLogger.LOGGER.scaleDownSkipNonEmptySnfDelete(
+                     snfQueue.getName().toString(), snfQueue.getMessageCount());
+                  return;
                }
                logger.debug("Scaling down queue {}", snfQueue);
                try {
