@@ -969,44 +969,96 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
          return;
       }
 
+      MessageFlowRecord deadRecord = null;
+      Bridge deadBridge = null;
+      boolean createAfterClose = false;
+
       synchronized (recordsGuard) {
          try {
             MessageFlowRecord record = records.get(nodeID);
 
             if (record == null) {
-               if (logger.isDebugEnabled()) {
-                  logger.debug("{}::Creating record for nodeID={}, topologyMember={}", this, nodeID, topologyMember);
-               }
-
-               // New node - create a new flow record
-
-               final SimpleString queueName = getSfQueueName(nodeID);
-
-               Binding queueBinding = postOffice.getBinding(queueName);
-
-               Queue queue;
-
-               if (queueBinding != null) {
-                  queue = (Queue) queueBinding.getBindable();
-               } else {
-                  // Add binding in storage so the queue will get reloaded on startup and we can find it - it's never
-                  // actually routed to at that address though
-                  queue = server.createQueue(QueueConfiguration.of(queueName).setRoutingType(RoutingType.MULTICAST).setAutoCreateAddress(true).setMaxConsumers(-1).setPurgeOnNoConsumers(false).setInternal(true));
-               }
-
-               // There are a few things that will behave differently when it's an internal queue
-               // such as we don't hold groupIDs inside the SnF queue
-               queue.setInternalQueue(true);
-
-               createNewRecord(topologyMember.getUniqueEventID(), nodeID, topologyMember.getPrimary(), queueName, queue, true);
+               createFlowRecord(topologyMember, nodeID);
             } else {
-               if (logger.isTraceEnabled()) {
+               Bridge existingBridge = record.getBridge();
+               boolean bridgeDead = record.isClosed()
+                  || existingBridge == null
+                  || isBridgeLocatorClosed(existingBridge);
+               if (bridgeDead) {
+                  logger.debug("{}::Replacing dead flow record for nodeID={}", this, nodeID);
+                  records.remove(nodeID);
+                  deadRecord = record;
+                  deadBridge = existingBridge;
+                  createAfterClose = true;
+               } else if (logger.isTraceEnabled()) {
                   logger.trace("{} ignored nodeUp record for {} on nodeID={} as the record already existed", this, topologyMember, nodeID);
                }
             }
          } catch (Exception e) {
             ActiveMQServerLogger.LOGGER.errorUpdatingTopology(e);
          }
+      }
+
+      // Close/flush outside recordsGuard: record.close() → bridge statusLock; deliverers may
+      // hold statusLock and then call isCurrentBridge / removeRecord.
+      closeRecordAndFlush(deadRecord, deadBridge);
+
+      if (createAfterClose) {
+         synchronized (recordsGuard) {
+            try {
+               if (!stopping && !records.containsKey(nodeID)) {
+                  createFlowRecord(topologyMember, nodeID);
+               }
+            } catch (Exception e) {
+               ActiveMQServerLogger.LOGGER.errorUpdatingTopology(e);
+            }
+         }
+      }
+   }
+
+   private void createFlowRecord(final TopologyMember topologyMember, final String nodeID) throws Exception {
+      if (logger.isDebugEnabled()) {
+         logger.debug("{}::Creating record for nodeID={}, topologyMember={}", this, nodeID, topologyMember);
+      }
+
+      final SimpleString queueName = getSfQueueName(nodeID);
+
+      Binding queueBinding = postOffice.getBinding(queueName);
+
+      Queue queue;
+
+      if (queueBinding != null) {
+         queue = (Queue) queueBinding.getBindable();
+      } else {
+         // Add binding in storage so the queue will get reloaded on startup and we can find it - it's never
+         // actually routed to at that address though
+         queue = server.createQueue(QueueConfiguration.of(queueName).setRoutingType(RoutingType.MULTICAST).setAutoCreateAddress(true).setMaxConsumers(-1).setPurgeOnNoConsumers(false).setInternal(true));
+      }
+
+      // There are a few things that will behave differently when it's an internal queue
+      // such as we don't hold groupIDs inside the SnF queue
+      queue.setInternalQueue(true);
+
+      createNewRecord(topologyMember.getUniqueEventID(), nodeID, topologyMember.getPrimary(), queueName, queue, true);
+   }
+
+   private static boolean isBridgeLocatorClosed(Bridge bridge) {
+      return bridge instanceof BridgeImpl bi
+         && bi.getServerLocator() != null
+         && bi.getServerLocator().isClosed();
+   }
+
+   private void closeRecordAndFlush(MessageFlowRecord record, Bridge bridge) {
+      if (record == null) {
+         return;
+      }
+      try {
+         record.close();
+      } catch (Exception e) {
+         ActiveMQServerLogger.LOGGER.failedToRemoveRecord(e);
+      }
+      if (bridge != null) {
+         bridge.flushExecutor();
       }
    }
 
