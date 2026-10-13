@@ -3517,51 +3517,99 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
                                         final SimpleString newAddress) throws Exception {
       Message copyMessage = makeCopy(ref, false, false, newAddress);
 
+      Object originalRoutingType = ref.getMessage().getBrokerProperty(Message.HDR_ORIG_ROUTING_TYPE);
+      if (originalRoutingType instanceof Byte originalRoutingTypeByte) {
+         copyMessage.setRoutingType(RoutingType.getType(originalRoutingTypeByte));
+      }
+
       byte[] oldRouteToIDs = null;
-      String targetNodeID;
-      Binding targetBinding;
 
-      // remove the old route
-      for (SimpleString propName : copyMessage.getPropertyNames()) {
+      // remove all old route-to headers (required before anycast full re-route)
+      for (SimpleString propName : copyMessage.getPropertyNames().toArray(new SimpleString[0])) {
          if (propName.startsWith(Message.HDR_ROUTE_TO_IDS)) {
-            oldRouteToIDs = (byte[]) copyMessage.removeProperty(propName.toString());
-
-            if (logger.isDebugEnabled()) {
-               final String hashcodeToString = oldRouteToIDs.toString(); // don't use Arrays.toString(..) here
-               logger.debug("Removed property from message: {} = {} ({})", propName, hashcodeToString, ByteBuffer.wrap(oldRouteToIDs).getLong());
+            byte[] ids = (byte[]) copyMessage.removeProperty(propName.toString());
+            if (oldRouteToIDs == null) {
+               oldRouteToIDs = ids;
             }
 
-            // there should only be one of these properties so potentially save some loop iterations
-            break;
+            if (logger.isDebugEnabled() && ids != null) {
+               final String hashcodeToString = ids.toString(); // don't use Arrays.toString(..) here
+               logger.debug("Removed property from message: {} = {} ({})", propName, hashcodeToString, ByteBuffer.wrap(ids).getLong());
+            }
          }
       }
 
-      ByteBuffer oldBuffer = ByteBuffer.wrap(oldRouteToIDs);
+      if (oldRouteToIDs == null) {
+         // No directed route metadata: treat as anycast-style rediscovery via full route
+         logger.debug("No HDR_ROUTE_TO_IDS on SnF message {}; falling back to postOffice.route", ref);
+         postOffice.route(copyMessage, new RoutingContextImpl(tx), false);
+         finishSnFMove(tx, ref);
+         return true;
+      }
 
+      ByteBuffer oldBuffer = ByteBuffer.wrap(oldRouteToIDs);
       RoutingContext routingContext = new RoutingContextImpl(tx);
+      boolean hadMiss = false;
 
       /*
-       * this algorithm will look at the old route and find the new remote queue bindings where the messages should go
-       * and route them there directly
+       * Look at the old route and find the new remote queue bindings where the messages should go
+       * and route them there directly. Collect misses for routing-type-aware fallback.
        */
       while (oldBuffer.hasRemaining()) {
          long oldQueueID = oldBuffer.getLong();
 
-         // look at all the bindings
          Pair<String, Binding> result = locateTargetBinding(queueSuffix, copyMessage, oldQueueID);
-         targetBinding = result.getB();
-         targetNodeID = result.getA();
+         Binding targetBinding = result.getB();
+         String targetNodeID = result.getA();
 
-         if (targetBinding == null) {
+         if (targetBinding == null || targetBinding.getBindable() == this) {
             ActiveMQServerLogger.LOGGER.unableToFindTargetQueue(targetNodeID);
+            hadMiss = true;
          } else {
             logger.debug("Routing on binding: {}", targetBinding);
             targetBinding.route(copyMessage, routingContext);
          }
       }
 
-      postOffice.processRoute(copyMessage, routingContext, false);
+      if (!hadMiss) {
+         postOffice.processRoute(copyMessage, routingContext, false);
+         finishSnFMove(tx, ref);
+         return true;
+      }
 
+      final boolean multicast = RoutingType.MULTICAST.equals(copyMessage.getRoutingType());
+
+      if (multicast) {
+         // Per-routingName rediscovery for misses; never full-address fan-out (duplicate risk).
+         // Re-scan IDs and route directed hits + rediscovered names into one context.
+         routingContext = new RoutingContextImpl(tx);
+         oldBuffer.rewind();
+         while (oldBuffer.hasRemaining()) {
+            long oldQueueID = oldBuffer.getLong();
+            Pair<String, Binding> result = locateTargetBinding(queueSuffix, copyMessage, oldQueueID);
+            Binding targetBinding = result.getB();
+            if (targetBinding == null || targetBinding.getBindable() == this) {
+               targetBinding = locateBindingByRoutingName(oldQueueID, queueSuffix);
+            }
+            if (targetBinding != null && targetBinding.getBindable() != this) {
+               targetBinding.route(copyMessage, routingContext);
+            } else {
+               logger.debug("No remaining binding for multicast routing name of queueID {}", oldQueueID);
+            }
+         }
+         postOffice.processRoute(copyMessage, routingContext, false);
+         finishSnFMove(tx, ref);
+         return true;
+      }
+
+      // Anycast: full postOffice.route as if newly received (honors NO_BINDINGS / DLA policy)
+      logger.debug("Anycast SnF relocate miss; falling back to postOffice.route for {}", copyMessage);
+      postOffice.route(copyMessage, new RoutingContextImpl(tx), false);
+      finishSnFMove(tx, ref);
+      return true;
+   }
+
+   private void finishSnFMove(final Transaction tx, final MessageReference ref) throws Exception {
       ref.handled();
 
       acknowledge(tx, ref);
@@ -3578,8 +3626,53 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
             deliverAsync();
          }
       });
+   }
 
-      return true;
+   /**
+    * Find a remaining local or remote binding with the same routing name as {@code oldQueueID},
+    * preferring the scale-down target node suffix. Skips this SnF queue and disabled remotes.
+    */
+   private Binding locateBindingByRoutingName(final long oldQueueID, final SimpleString preferSuffix) {
+      SimpleString routingName = null;
+      for (RemoteQueueBinding remoteQueueBinding : iterableOf(postOffice.getAllBindings()
+                                                                 .filter(RemoteQueueBinding.class::isInstance)
+                                                                 .map(RemoteQueueBinding.class::cast))) {
+         if (oldQueueID == remoteQueueBinding.getRemoteQueueID()) {
+            routingName = remoteQueueBinding.getRoutingName();
+            break;
+         }
+      }
+      if (routingName == null) {
+         return null;
+      }
+
+      Binding preferred = null;
+      Binding any = null;
+      final String preferNode = preferSuffix != null ? preferSuffix.toString() : null;
+
+      for (Binding binding : iterableOf(postOffice.getAllBindings())) {
+         if (!routingName.equals(binding.getRoutingName())) {
+            continue;
+         }
+         if (binding.getBindable() == this) {
+            continue;
+         }
+         if (binding instanceof RemoteQueueBinding remote && !remote.isEnabled()) {
+            continue;
+         }
+         if (binding instanceof RemoteQueueBinding remote) {
+            String temp = remote.getQueue().getName().toString();
+            String nodeId = temp.substring(temp.lastIndexOf('.') + 1);
+            if (preferNode != null && preferNode.equals(nodeId)) {
+               preferred = binding;
+               break;
+            }
+         }
+         if (any == null) {
+            any = binding;
+         }
+      }
+      return preferred != null ? preferred : any;
    }
 
    private Pair<String, Binding> locateTargetBinding(SimpleString queueSuffix, Message copyMessage, long oldQueueID) {
