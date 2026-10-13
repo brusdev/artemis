@@ -888,10 +888,19 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       return state;
    }
 
+   /**
+    * Whether this {@link #fail(boolean, boolean)} may mark {@code targetNodeID} down in the
+    * locator topology. Cluster bridges override to require flow-record ownership so a stale
+    * bridge cannot poison a recovered member.
+    */
+   protected boolean shouldNotifyNodeDownOnFail() {
+      return targetNodeID != null;
+   }
+
    protected void fail(final boolean permanently, boolean scaleDown) {
       logger.debug("{}\n\t::fail being called, permanently={}", this, permanently);
       //we need to make sure we remove the node from the topology so any incoming quorum requests are voted correctly
-      if (targetNodeID != null) {
+      if (shouldNotifyNodeDownOnFail()) {
          this.disconnectedAndDown = true;
          serverLocator.notifyNodeDown(System.currentTimeMillis(), targetNodeID);
       }

@@ -1774,6 +1774,14 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
    }
 
    @Override
+   public boolean isCurrentBridge(String targetNodeID, Bridge bridge) {
+      synchronized (recordsGuard) {
+         MessageFlowRecord record = records.get(targetNodeID);
+         return record != null && record.getBridge() == bridge;
+      }
+   }
+
+   @Override
    public void removeRecord(String targetNodeID) {
       synchronized (recordsGuard) {
          logger.debug("Removing record for: {}", targetNodeID);

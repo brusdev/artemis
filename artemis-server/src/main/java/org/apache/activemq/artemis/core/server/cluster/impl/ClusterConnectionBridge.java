@@ -427,9 +427,20 @@ public class ClusterConnectionBridge extends BridgeImpl {
    }
 
    @Override
+   protected boolean shouldNotifyNodeDownOnFail() {
+      return targetNodeID != null && clusterConnection.isCurrentBridge(targetNodeID, this);
+   }
+
+   @Override
    protected void fail(final boolean permanently, final boolean scaleDown) {
       logger.debug("Cluster Bridge {} failed, permanently={}", this.getName(), permanently);
+      final boolean ownsRecord = clusterConnection.isCurrentBridge(targetNodeID, this);
       super.fail(permanently, scaleDown);
+
+      if (!ownsRecord) {
+         logger.debug("Ignoring stale fail for {}; no longer current bridge", targetNodeID);
+         return;
+      }
 
       if (permanently) {
          logger.debug("cluster node for bridge {} is permanently down", this.getName());
