@@ -76,6 +76,11 @@ public interface ClusterConnection extends ActiveMQComponent, ClusterTopologyLis
 
    void removeRecord(String targetNodeID);
 
+   /**
+    * {@return true if {@code bridge} is the bridge currently mapped for {@code targetNodeID}}
+    */
+   boolean isCurrentBridge(String targetNodeID, Bridge bridge);
+
    void disconnectRecord(String targetNodeID);
 
    long getCallTimeout();
