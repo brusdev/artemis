@@ -2576,6 +2576,15 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
       });
    }
 
+   /**
+    * Whether this queue has no residual references that would be destroyed by a scale-down
+    * {@code deleteQueue}. Accounts for pending intermediate refs that may not yet be reflected
+    * in {@link #getMessageCount()}.
+    */
+   public boolean isEmptyForScaleDown() {
+      return getMessageCount() == 0 && intermediateMessageReferences.isEmpty();
+   }
+
    @Override
    public boolean copyReference(final long messageID,
                                 final SimpleString toQueue,

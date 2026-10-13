@@ -33,6 +33,15 @@ public interface RemoteQueueBinding extends QueueBinding {
 
    void connect();
 
+   /**
+    * Whether this remote binding may be selected for address routing. Disabled bindings remain
+    * in the post office for relocate lookup ({@code locateTargetBinding}) but are never chosen
+    * for new sends (used to fence ingress into a SnF queue being drained on scale-down).
+    */
+   boolean isEnabled();
+
+   void setEnabled(boolean enabled);
+
    long getRemoteQueueID();
 
    void setFilter(Filter filter);

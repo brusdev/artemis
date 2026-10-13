@@ -1562,4 +1562,10 @@ public interface ActiveMQServerLogger {
 
    @LogMessage(id = 224172, value = "Failed to remove binding {} from address {} during wildcard address cleanup", level = LogMessage.Level.WARN)
    void failedToRemoveBindingDuringWildcardCleanup(String binding, String address, Exception e);
+
+   @LogMessage(id = 224173, value = "Scale-down drain incomplete after {} iterations; queue={} still not empty (count={}); skipping SnF delete", level = LogMessage.Level.WARN)
+   void scaleDownDrainIncomplete(int iterations, String queueName, long messageCount);
+
+   @LogMessage(id = 224174, value = "Skipping scale-down delete of non-empty SnF queue {} (count={})", level = LogMessage.Level.WARN)
+   void scaleDownSkipNonEmptySnfDelete(String queueName, long messageCount);
 }

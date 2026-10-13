@@ -35,4 +35,9 @@ public interface MessageFlowRecord extends MessageHandler {
    void reset() throws Exception;
 
    void disconnectBindings() throws Exception;
+
+   /**
+    * Enable or disable all remote bindings owned by this flow record for address routing.
+    */
+   void setBindingsEnabled(boolean enabled);
 }

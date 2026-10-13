@@ -479,6 +479,10 @@ public final class BindingsImpl implements Bindings {
    private static boolean matchBinding(final Message message,
                                        final Binding binding,
                                        final MessageLoadBalancingType loadBalancingType) {
+      if (binding instanceof RemoteQueueBinding remote && !remote.isEnabled()) {
+         return false;
+      }
+
       if (loadBalancingType.equals(MessageLoadBalancingType.OFF) || loadBalancingType.equals(MessageLoadBalancingType.OFF_WITH_REDISTRIBUTION)) {
          if (!Objects.equals(message.getRoutingType(), RoutingType.MULTICAST) && binding instanceof RemoteQueueBinding) {
             return false;

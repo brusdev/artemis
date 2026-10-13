@@ -1495,6 +1495,14 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
          }
       }
 
+      @Override
+      public synchronized void setBindingsEnabled(boolean enabled) {
+         logger.debug("{} setBindingsEnabled({})", ClusterConnectionImpl.this, enabled);
+         for (RemoteQueueBinding binding : bindings.values()) {
+            binding.setEnabled(enabled);
+         }
+      }
+
       private synchronized void doBindingUpdated(final ClientMessage message) throws Exception {
          logger.trace("{} Update binding {}", ClusterConnectionImpl.this, message);
          if (!message.containsProperty(ManagementHelper.HDR_CLUSTER_NAME)) {
@@ -1549,6 +1557,8 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
          if (existingBinding != null) {
             if (queueID.equals(existingBinding.getRemoteQueueID())) {
+               // Reuse path: never leave a previously disabled binding stuck unroutable
+               existingBinding.setEnabled(true);
                if (!existingBinding.isConnected()) {
                   existingBinding.connect();
                   return;
