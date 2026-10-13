@@ -444,16 +444,26 @@ public class ClusterConnectionBridge extends BridgeImpl {
 
       if (permanently) {
          logger.debug("cluster node for bridge {} is permanently down", this.getName());
-         clusterConnection.removeRecord(targetNodeID);
+         final boolean removedOurs = clusterConnection.removeRecord(targetNodeID, this, scaleDown);
 
-         if (scaleDown) {
+         if (scaleDown && removedOurs) {
+            final Queue snfQueue = queue;
+            final String nodeId = targetNodeID;
+            final ClusterConnectionImpl cc = (ClusterConnectionImpl) clusterConnection;
             executor.execute(() -> {
-               logger.debug("Scaling down queue {}", queue);
+               // Re-check under recordsGuard so a concurrent nodeUP cannot lose its SnF queue
+               synchronized (cc.recordsGuard) {
+                  if (cc.getRecords().containsKey(nodeId)) {
+                     logger.debug("Skipping SnF delete for {}; a live flow record exists again", nodeId);
+                     return;
+                  }
+               }
+               logger.debug("Scaling down queue {}", snfQueue);
                try {
-                  queue.deleteQueue(true);
-                  queue.removeAddress();
+                  snfQueue.deleteQueue(true);
+                  snfQueue.removeAddress();
                } catch (ActiveMQAddressDoesNotExistException e) {
-                  logger.debug("ActiveMQAddressDoesNotExistException during scale down for queue {}", queue);
+                  logger.debug("ActiveMQAddressDoesNotExistException during scale down for queue {}", snfQueue);
                } catch (Exception e) {
                   logger.warn(e.getMessage(), e);
                }
