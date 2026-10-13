@@ -77,6 +77,15 @@ public interface ClusterConnection extends ActiveMQComponent, ClusterTopologyLis
    void removeRecord(String targetNodeID);
 
    /**
+    * Remove the flow record for {@code targetNodeID} only if {@code bridge} currently owns it.
+    *
+    * @param scaleDown when {@code true}, skip topology-based recreate and allow the caller to
+    *                  delete the SnF queue; when {@code false}, preserve restart recreate behavior
+    * @return {@code true} if this bridge owned the record and it was removed
+    */
+   boolean removeRecord(String targetNodeID, Bridge bridge, boolean scaleDown);
+
+   /**
     * {@return true if {@code bridge} is the bridge currently mapped for {@code targetNodeID}}
     */
    boolean isCurrentBridge(String targetNodeID, Bridge bridge);

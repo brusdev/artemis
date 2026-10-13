@@ -828,6 +828,12 @@ When configured for scale down a server can copy all its messages and transactio
 The advantage of this is that you don't need full backups to provide some form of HA, however there are disadvantages with this approach the first being that it only deals with a server being stopped and not a server crash.
 The caveat here is if you configure a backup to scale down.
 
+Cluster connections maintain internal store-and-forward queues named like `$.artemis.internal.sf.<cluster>.<nodeId>` for each remote primary.
+Those queues are created when a remote node appears in the topology.
+On scale-down, peers delete the SnF queue for the departing node ID after handling the scale-down signal.
+A node that returns with the same node ID without scale-down keeps its SnF queue; a scale-down followed by a new broker identity creates a new SnF queue.
+These queues are not for application use.
+
 Another disadvantage is that it is possible to lose message ordering.
 This happens in the following scenario, say you have 2 active servers and messages are distributed evenly between the servers from a single producer, if one of the servers scales down then the messages sent back to the other server will be in the queue after the ones already there, so server 1 could have messages 1,3,5,7,9 and server 2 would have 2,4,6,8,10, if server 2 scales down the order in server 1 would be 1,3,5,7,9,2,4,6,8,10.
 

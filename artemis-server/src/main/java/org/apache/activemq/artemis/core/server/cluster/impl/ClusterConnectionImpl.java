@@ -1783,15 +1783,28 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
    @Override
    public void removeRecord(String targetNodeID) {
+      removeRecord(targetNodeID, null, false);
+   }
+
+   @Override
+   public boolean removeRecord(String targetNodeID, Bridge bridge, boolean scaleDown) {
       synchronized (recordsGuard) {
-         logger.debug("Removing record for: {}", targetNodeID);
-         MessageFlowRecord record = records.remove(targetNodeID);
+         logger.debug("Removing record for: {}, scaleDown={}", targetNodeID, scaleDown);
+         MessageFlowRecord record = records.get(targetNodeID);
+         if (record == null) {
+            return false;
+         }
+         // null bridge keeps the legacy/test entry point (no ownership check)
+         if (bridge != null && record.getBridge() != bridge) {
+            logger.debug("Ignoring removeRecord for {}; caller is not the current bridge", targetNodeID);
+            return false;
+         }
+
+         records.remove(targetNodeID);
          Bridge oldBridge = null;
          try {
-            if (record != null) {
-               oldBridge = record.getBridge();
-               record.close();
-            }
+            oldBridge = record.getBridge();
+            record.close();
          } catch (Exception e) {
             ActiveMQServerLogger.LOGGER.failedToRemoveRecord(e);
          }
@@ -1802,6 +1815,12 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
          // the new bridge's connection attempt.
          if (oldBridge != null) {
             oldBridge.flushExecutor();
+         }
+
+         // Scale-down must not recreate: the SnF queue for this node ID is about to be
+         // deleted. Recreate-then-delete races with ARTEMIS-6153's restart path.
+         if (scaleDown) {
+            return true;
          }
 
          TopologyMemberImpl member = topology.getMember(targetNodeID);
@@ -1822,6 +1841,7 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
                ActiveMQServerLogger.LOGGER.errorUpdatingTopology(e);
             }
          }
+         return true;
       }
    }
 
