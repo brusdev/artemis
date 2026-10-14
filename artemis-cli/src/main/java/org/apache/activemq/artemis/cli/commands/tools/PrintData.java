@@ -135,7 +135,7 @@ public class PrintData extends DBOption {
 
       printBanner(out, MESSAGES_BANNER);
 
-      DescribeJournal describeJournal = DescribeJournal.printSurvivingRecords(storageManager.getMessageJournal(), out, safe, ascii);
+      DescribeJournal describeJournal = DescribeJournal.printSurvivingRecords(storageManager.getMessageJournal(), out, safe, ascii, bindings.getNextID());
 
       printPages(describeJournal, storageManager, pagingmanager, out, safe, maxPages, bindings, ascii);
 
@@ -190,13 +190,15 @@ public class PrintData extends DBOption {
          bindingsDescribe = printBindings(bindingsDirectory, out, safe, true, true, reclaimed, ascii);
       }
 
+      long nextID = bindingsDescribe != null ? bindingsDescribe.getNextID() : 0;
+
       printBanner(out, MESSAGES_BANNER);
       if (skipJournal) {
          out.println(".... skipping");
          out.println();
       }
       DescribeJournal describeJournal = null;
-      describeJournal = printMessages(messagesDirectory, out, safe, !skipJournal, !skipJournal, reclaimed, ascii);
+      describeJournal = printMessages(messagesDirectory, out, safe, !skipJournal, !skipJournal, reclaimed, ascii, nextID);
 
       if (describeJournal == null) {
          return;
@@ -222,9 +224,13 @@ public class PrintData extends DBOption {
    }
 
    public static DescribeJournal printMessages(File messagesDirectory, PrintStream out, boolean safe, boolean printRecords, boolean printSurviving, boolean reclaimed, boolean ascii) {
+      return printMessages(messagesDirectory, out, safe, printRecords, printSurviving, reclaimed, ascii, 0);
+   }
+
+   public static DescribeJournal printMessages(File messagesDirectory, PrintStream out, boolean safe, boolean printRecords, boolean printSurviving, boolean reclaimed, boolean ascii, long nextID) {
       DescribeJournal describeJournal;
       try {
-         describeJournal = DescribeJournal.describeMessagesJournal(messagesDirectory, out, safe, printRecords, printSurviving, reclaimed, ascii);
+         describeJournal = DescribeJournal.describeMessagesJournal(messagesDirectory, out, safe, printRecords, printSurviving, reclaimed, ascii, nextID);
       } catch (Exception e) {
          e.printStackTrace();
          return null;
@@ -294,7 +300,8 @@ public class PrintData extends DBOption {
 
       SimpleString[] stores = manager.getStoreNames();
 
-      int[] pageColumnSizes = {10, 10, 12, safe ? 10 : 100, 10};
+      int idColumnSize = bindingsDescribe != null ? bindingsDescribe.getIDColumnSize() : 10;
+      int[] pageColumnSizes = {10, idColumnSize, idColumnSize, safe ? 10 : 100, 10};
       TableOut pageTable = ascii ? null : new TableOut("|", 2, pageColumnSizes);
 
       for (SimpleString store : stores) {

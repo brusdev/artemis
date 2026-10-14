@@ -125,6 +125,7 @@ public final class DescribeJournal {
    private final List<RecordInfo> records;
    private final List<PreparedTransactionInfo> preparedTransactions;
    private List<PersistentQueueBindingEncoding> bindingEncodings;
+   private long nextID;
 
    private static Configuration getConfiguration() {
       Configuration configuration;
@@ -168,6 +169,19 @@ public final class DescribeJournal {
       return this;
    }
 
+   public long getNextID() {
+      return nextID;
+   }
+
+   public DescribeJournal setNextID(long nextID) {
+      this.nextID = nextID;
+      return this;
+   }
+
+   public int getIDColumnSize() {
+      return Math.max(8, String.valueOf(nextID).length());
+   }
+
    public List<RecordInfo> getRecords() {
       return records;
    }
@@ -194,7 +208,7 @@ public final class DescribeJournal {
       SequentialFileFactory bindingsFF = new NIOSequentialFileFactory(bindingsDir, null, 1);
 
       JournalImpl bindings = new JournalImpl(1024 * 1024, 2, 2, -1, 0, bindingsFF, "activemq-bindings", "bindings", 1);
-      return describeJournal(bindingsFF, bindings, bindingsDir, out, safe, printRecords, printSurviving, reclaimed, legacyOutput);
+      return describeJournal(bindingsFF, bindings, bindingsDir, out, safe, printRecords, printSurviving, reclaimed, legacyOutput, 0);
    }
 
    public static DescribeJournal describeMessagesJournal(final File messagesDir) throws Exception {
@@ -206,13 +220,17 @@ public final class DescribeJournal {
    }
 
    public static DescribeJournal describeMessagesJournal(final File messagesDir, PrintStream out, boolean safe, boolean printRecords, boolean printSurviving, boolean reclaimed, boolean legacyOutput) throws Exception {
+      return describeMessagesJournal(messagesDir, out, safe, printRecords, printSurviving, reclaimed, legacyOutput, 0);
+   }
+
+   public static DescribeJournal describeMessagesJournal(final File messagesDir, PrintStream out, boolean safe, boolean printRecords, boolean printSurviving, boolean reclaimed, boolean legacyOutput, long nextID) throws Exception {
       Configuration configuration = getConfiguration();
       SequentialFileFactory messagesFF = new NIOSequentialFileFactory(messagesDir, null, 1);
 
       // Will use only default values. The load function should adapt to anything different
       JournalImpl messagesJournal = new JournalImpl(configuration.getJournalFileSize(), configuration.getJournalMinFiles(), configuration.getJournalPoolFiles(), 0, 0, messagesFF, "activemq-data", "amq", 1);
 
-      return describeJournal(messagesFF, messagesJournal, messagesDir, out, safe, printRecords, printSurviving, reclaimed, legacyOutput);
+      return describeJournal(messagesFF, messagesJournal, messagesDir, out, safe, printRecords, printSurviving, reclaimed, legacyOutput, nextID);
    }
 
    private static final PrintStream nullPrintStream = new PrintStream(new OutputStream() {
@@ -230,7 +248,8 @@ public final class DescribeJournal {
                                                   boolean printRecords,
                                                   boolean printSurving,
                                                   boolean reclaimed,
-                                                  boolean legacyOutput) throws Exception {
+                                                  boolean legacyOutput,
+                                                  long nextID) throws Exception {
       List<JournalFile> files = journal.orderFiles();
 
       final Map<Long, PageSubscriptionCounterImpl> counters = new HashMap<>();
@@ -240,7 +259,8 @@ public final class DescribeJournal {
 
       recordsPrintStream.println("Journal path: " + path);
 
-      final int[] journalColumnSizes = {10, 8, 30, 10, 8, 120};
+      int idColumnSize = nextID > 0 ? Math.max(8, String.valueOf(nextID).length()) : 8;
+      final int[] journalColumnSizes = {10, idColumnSize, 30, idColumnSize, 8, 120};
       final TableOut journalTable = legacyOutput ? null : new TableOut("|", 2, journalColumnSizes);
 
       for (JournalFile file : files) {
@@ -401,7 +421,7 @@ public final class DescribeJournal {
          printCounters(recordsPrintStream, counters, legacyOutput);
       }
 
-      return printSurvivingRecords(journal, survivingPrintStrea, safe, legacyOutput);
+      return printSurvivingRecords(journal, survivingPrintStrea, safe, legacyOutput, nextID);
    }
 
    public static DescribeJournal printSurvivingRecords(Journal journal,
@@ -414,9 +434,19 @@ public final class DescribeJournal {
                                                        PrintStream out,
                                                        boolean safe,
                                                        boolean legacyOutput) throws Exception {
+      return printSurvivingRecords(journal, out, safe, legacyOutput, 0);
+   }
+
+   public static DescribeJournal printSurvivingRecords(Journal journal,
+                                                       PrintStream out,
+                                                       boolean safe,
+                                                       boolean legacyOutput,
+                                                       long nextID) throws Exception {
 
       final Map<Long, PageSubscriptionCounterImpl> counters = new HashMap<>();
       out.println("### Surviving Records Summary ###");
+
+      int idColumnSize = nextID > 0 ? Math.max(8, String.valueOf(nextID).length()) : 8;
 
       List<RecordInfo> records = new LinkedList<>();
       List<PreparedTransactionInfo> preparedTransactions = new LinkedList<>();
@@ -456,6 +486,7 @@ public final class DescribeJournal {
             return Integer.hashCode(value);
          }
       }
+      long localNextID = 0;
       long messageCount = 0;
       long largeMessageCount = 0;
       Map<Long, Count> messageRefCounts = new HashMap<>();
@@ -474,7 +505,7 @@ public final class DescribeJournal {
 
       }, false);
 
-      final int[] survivingColumnSizes = {10, 8, 30, 7, 120};
+      final int[] survivingColumnSizes = {10, idColumnSize, 30, 7, 120};
       final TableOut survivingTable = legacyOutput ? null : new TableOut("|", 2, survivingColumnSizes);
       if (survivingTable != null) {
          survivingTable.printTopSeparator(out);
@@ -524,6 +555,9 @@ public final class DescribeJournal {
 
             subsCounter.loadInc(info.id, encoding.getValue(), encoding.getPersistentSize());
             subsCounter.processReload();
+         } else if (userRecordType == ID_COUNTER_RECORD) {
+            ActiveMQBuffer buffer = ActiveMQBuffers.wrappedBuffer(info.data);
+            localNextID = buffer.readLong();
          } else if (userRecordType == QUEUE_BINDING_RECORD) {
             PersistentQueueBindingEncoding bindingEncoding = (PersistentQueueBindingEncoding) DescribeJournal.newObjectEncoding(info, null);
             if (bindings == null) {
@@ -667,7 +701,7 @@ public final class DescribeJournal {
 
       journal.stop();
 
-      return new DescribeJournal(records, preparedTransactions).setBindingEncodings(bindings);
+      return new DescribeJournal(records, preparedTransactions).setBindingEncodings(bindings).setNextID(localNextID);
    }
 
    protected static void printCounters(final PrintStream out, final Map<Long, PageSubscriptionCounterImpl> counters) {
