@@ -29,10 +29,13 @@ import javax.jms.Session;
 import java.io.File;
 import java.lang.invoke.MethodHandles;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -58,8 +61,7 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
    private static final String TEST_NAME = "CLUSTER_REDISTRIBUTION";
    private static final boolean TEST_ENABLED = Boolean.parseBoolean(testProperty(TEST_NAME, "TEST_ENABLED", "true"));
    private static final int NUMBER_OF_SERVERS = testProperty(TEST_NAME, "NUMBER_OF_SERVERS", 8);
-   private static final int NUMBER_OF_MESSAGES = testProperty(TEST_NAME, "NUMBER_OF_MESSAGES", 5_000);
-   private static final String MESSAGE_LOAD_BALANCING = testProperty(TEST_NAME, "MESSAGE_LOAD_BALANCING", "OFF_WITH_REDISTRIBUTION");
+   private static final String MESSAGE_LOAD_BALANCING = testProperty(TEST_NAME, "MESSAGE_LOAD_BALANCING", "ON_DEMAND");
    private static final int TIMEOUT_MINUTES = testProperty(TEST_NAME, "TIMEOUT_MINUTES", 5);
    private static final int CONSUMER_RECONNECT_INTERVAL_MS = testProperty(TEST_NAME, "CONSUMER_RECONNECT_INTERVAL_MS", 2000);
 
@@ -76,7 +78,7 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
       private ReadWriteLock readWriteLock = new ReentrantReadWriteLock(true);
       AtomicInteger startNumber = new AtomicInteger();
 
-      public ServerRecord(File serverLocation, String serverName, int id) {
+      ServerRecord(File serverLocation, String serverName, int id) {
          this.serverLocation = serverLocation;
          this.brokerProperties = new File(serverLocation, "broker.properties");
          this.serverName = serverName;
@@ -129,7 +131,7 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
    }
 
 
-   private final static ServerRecord[] serverRecords = new ServerRecord[NUMBER_OF_SERVERS];
+   private static final ServerRecord[] serverRecords = new ServerRecord[NUMBER_OF_SERVERS];
 
    @BeforeAll
    public static void createServers() throws Exception {
@@ -165,6 +167,9 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
 
          Properties brokerProperties = new Properties();
          brokerProperties.put("addressesSettings.#.redistributionDelay", "0");
+         brokerProperties.put("HAPolicyConfiguration", "PRIMARY_ONLY");
+         brokerProperties.put("HAPolicyConfiguration.scaleDownConfiguration.enabled", "true");
+         brokerProperties.put("HAPolicyConfiguration.scaleDownConfiguration.clusterName", "my-cluster");
          saveProperties(brokerProperties, new File(serverLocation, "broker.properties"));
          serverRecords[s] = new ServerRecord(serverLocation, serverName, s);
       }
@@ -211,10 +216,13 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
 
    @Test
    public void testRedistribution() throws Throwable {
-      final int totalExpected = NUMBER_OF_MESSAGES * NUMBER_OF_SERVERS;
       final AtomicInteger totalReceived = new AtomicInteger(0);
       final AtomicInteger totalSent = new AtomicInteger(0);
       final AtomicInteger errors = new AtomicInteger(0);
+      final AtomicInteger duplicates = new AtomicInteger(0);
+      final AtomicBoolean restartsComplete = new AtomicBoolean(false);
+      final AtomicBoolean producersComplete = new AtomicBoolean(false);
+      final Set<String> receivedMessageIds = ConcurrentHashMap.newKeySet();
 
       ExecutorService executorService = Executors.newFixedThreadPool(NUMBER_OF_SERVERS * 2);
       runAfter(executorService::shutdownNow);
@@ -224,14 +232,14 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
 
       for (int s = 0; s < NUMBER_OF_SERVERS; s++) {
          final int serverIndex = s;
-         executorService.execute(() -> consumeMessages(serverRecords[serverIndex], totalReceived, totalExpected, consumersDone));
+         executorService.execute(() -> consumeMessages(serverRecords[serverIndex], totalReceived, totalSent, producersComplete, receivedMessageIds, duplicates, consumersDone));
       }
 
       for (int s = 0; s < NUMBER_OF_SERVERS; s++) {
          final int serverIndex = s;
          executorService.execute(() -> {
             try {
-               produceMessages(serverRecords[serverIndex], totalSent);
+               produceMessages(serverRecords[serverIndex], totalSent, restartsComplete);
             } catch (Exception e) {
                logger.warn("Producer {} failed: {}", serverIndex, e.getMessage(), e);
                errors.incrementAndGet();
@@ -242,35 +250,36 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
       }
 
       for (int i = 0; i < serverRecords.length * 2; i++) {
-         if (producersDone.await(5, TimeUnit.SECONDS)) {
-            break;
-         }
-
          int serverToReStart = i % serverRecords.length;
          logger.info("Restarting server {}", serverToReStart);
-         serverRecords[serverToReStart].restartServer(serverToReStart % 2 == 0); // half of the server with kill, half with regular stop
+         serverRecords[serverToReStart].restartServer(serverToReStart % 2 == 0); // half with kill, half with graceful stop
          logger.info("Restarted server {}", serverToReStart);
       }
 
+      restartsComplete.set(true);
       assertTrue(producersDone.await(TIMEOUT_MINUTES, TimeUnit.MINUTES), "Producers did not complete in time");
-      assertTrue(consumersDone.await(TIMEOUT_MINUTES, TimeUnit.MINUTES), "Producers did not complete in time");
+
+      producersComplete.set(true);
+      assertTrue(consumersDone.await(TIMEOUT_MINUTES, TimeUnit.MINUTES), "Consumers did not complete in time");
+
+      Wait.assertEquals(totalSent.get(), () -> totalReceived.get(), TimeUnit.MINUTES.toMillis(TIMEOUT_MINUTES));
+
+      logger.info("Test finished: totalSent={}, totalReceived={}, duplicates={}", totalSent.get(), totalReceived.get(), duplicates.get());
+
       assertEquals(0, errors.get(), "Errors occurred during test");
-      assertEquals(totalExpected, totalSent.get(), "Not all messages were sent");
 
-      assertEquals(totalExpected, totalReceived.get(), TimeUnit.MINUTES.toMillis(TIMEOUT_MINUTES));
-
+      assertEquals(0, duplicates.get(), "Duplicate messages detected");
    }
 
-   private void produceMessages(ServerRecord serverRecord, AtomicInteger totalSent) throws Exception {
-
+   private void produceMessages(ServerRecord serverRecord, AtomicInteger totalSent, AtomicBoolean restartsComplete) throws Exception {
       int localSent = 0;
       int startNumber = -1;
-      while (localSent < NUMBER_OF_MESSAGES) {
+      while (!restartsComplete.get()) {
          try (ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory(serverRecord.serverURI()); Connection connection = factory.createConnection()) {
             startNumber = serverRecord.startNumber.get();
             Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
             MessageProducer producer = session.createProducer(session.createQueue(QUEUE_NAME));
-            for (; localSent < NUMBER_OF_MESSAGES; localSent++) {
+            while (!restartsComplete.get()) {
                serverRecord.readLock();
                try {
                   if (serverRecord.startNumber.get() != startNumber) {
@@ -278,12 +287,10 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
                      break;
                   }
                   producer.send(session.createTextMessage("server-" + serverRecord.serverId + "-msg-" + localSent));
-                  if (localSent % 100 == 0) {
-                     logger.debug("Sending message {}", localSent, serverRecord.serverId);
-                  }
+                  localSent++;
                   int sent = totalSent.incrementAndGet();
-                  if (sent % 100 == 0) {
-                     logger.debug("Total sent: {}", sent);
+                  if (localSent % 100 == 0) {
+                     logger.debug("Producer server={} localSent={} totalSent={}", serverRecord.serverId, localSent, sent);
                   }
                } finally {
                   serverRecord.readUnlock();
@@ -293,11 +300,11 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
       }
    }
 
-   private void consumeMessages(ServerRecord serverRecord, AtomicInteger totalReceived, int totalExpected, CountDownLatch consumersDone) {
+   private void consumeMessages(ServerRecord serverRecord, AtomicInteger totalReceived, AtomicInteger totalSent, AtomicBoolean producersComplete, Set<String> receivedMessageIds, AtomicInteger duplicates, CountDownLatch consumersDone) {
       try {
          int localReceived = 0;
          int startNumber = -1;
-         while (totalReceived.get() < totalExpected) {
+         while (!producersComplete.get() || totalReceived.get() < totalSent.get()) {
             try (ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory(serverRecord.serverURI()); Connection connection = factory.createConnection()) {
                startNumber = serverRecord.startNumber.get();
                connection.start();
@@ -305,7 +312,7 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
                MessageConsumer consumer = session.createConsumer(session.createQueue(QUEUE_NAME));
 
                long deadline = System.currentTimeMillis() + CONSUMER_RECONNECT_INTERVAL_MS;
-               while (System.currentTimeMillis() < deadline && totalReceived.get() < totalExpected) {
+               while (System.currentTimeMillis() < deadline && (!producersComplete.get() || totalReceived.get() < totalSent.get())) {
                   serverRecord.readLock();
                   try {
                      if (startNumber != serverRecord.startNumber.get()) {
@@ -313,11 +320,15 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
                         break;
                      }
                      Message msg = consumer.receive(1000);
-                     Thread.sleep(10);
                      if (msg != null) {
                         localReceived++;
+                        String msgId = msg.getJMSMessageID();
+                        if (!receivedMessageIds.add(msgId)) {
+                           int totalDuplicates = duplicates.incrementAndGet();
+                           logger.warn("Duplicate message detected: id={}, server={}, totalReceived={}, duplicates={}", msgId, serverRecord.serverId, totalReceived, totalDuplicates);
+                        }
                         if (localReceived % 100 == 0) {
-                           logger.debug("Received message={}, locallyReceived={}, totalReceived={}", serverRecord.serverId, localReceived, totalReceived);
+                           logger.debug("Consumer server={} locallyReceived={} totalReceived={} duplicates={}", serverRecord.serverId, localReceived, totalReceived, duplicates);
                         }
                         totalReceived.incrementAndGet();
                      }
@@ -326,7 +337,7 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
                   }
                }
                long sleepInterval = RandomUtil.randomInterval(1, CONSUMER_RECONNECT_INTERVAL_MS);
-               logger.info("Reconnecting consumer {}, locallyReceived={}, totalReceived={}, expected={}, sleeping for {}", serverRecord.serverId, localReceived, totalReceived, totalExpected, sleepInterval);
+               logger.info("Reconnecting consumer {}, locallyReceived={}, totalReceived={}, totalSent={}, duplicates={}, sleeping for {}", serverRecord.serverId, localReceived, totalReceived, totalSent, duplicates, sleepInterval);
 
                // need to make things a little unpredictable
                Thread.sleep(sleepInterval);
@@ -334,7 +345,7 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
                logger.debug("Consumer {} reconnecting after: {}", serverRecord.serverId, e.getMessage());
             }
          }
-         logger.debug("Consumer {} finished, received {} messages", serverRecord.serverId, localReceived);
+         logger.debug("Consumer {} finished, received {} messages, duplicates={}", serverRecord.serverId, localReceived, duplicates);
       } finally {
          consumersDone.countDown();
       }
