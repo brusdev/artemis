@@ -169,10 +169,19 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
          brokerProperties.put("addressesSettings.#.redistributionDelay", "0");
          brokerProperties.put("HAPolicyConfiguration", "PRIMARY_ONLY");
          brokerProperties.put("HAPolicyConfiguration.scaleDownConfiguration.enabled", "true");
-         brokerProperties.put("HAPolicyConfiguration.scaleDownConfiguration.clusterName", "my-cluster");
+         brokerProperties.put("HAPolicyConfiguration.scaleDownConfiguration.connectors", buildScaleDownConnectors());
          saveProperties(brokerProperties, new File(serverLocation, "broker.properties"));
          serverRecords[s] = new ServerRecord(serverLocation, serverName, s);
       }
+   }
+
+   private static String buildScaleDownConnectors() {
+      StringBuilder sb = new StringBuilder();
+      for (int i = 0; i < NUMBER_OF_SERVERS - 1; i++) {
+         if (i > 0) sb.append(",");
+         sb.append("node").append(i);
+      }
+      return sb.toString();
    }
 
    private static String buildStaticClusterURI(int excludeIndex) {
