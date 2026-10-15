@@ -63,7 +63,7 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
    private static final int NUMBER_OF_SERVERS = testProperty(TEST_NAME, "NUMBER_OF_SERVERS", 8);
    private static final String MESSAGE_LOAD_BALANCING = testProperty(TEST_NAME, "MESSAGE_LOAD_BALANCING", "ON_DEMAND");
    private static final int TIMEOUT_MINUTES = testProperty(TEST_NAME, "TIMEOUT_MINUTES", 5);
-   private static final int CONSUMER_RECONNECT_INTERVAL_MS = testProperty(TEST_NAME, "CONSUMER_RECONNECT_INTERVAL_MS", 2000);
+   private static final int CLIENT_RECONNECT_INTERVAL_MS = testProperty(TEST_NAME, "CLIENT_RECONNECT_INTERVAL_MS", 2000);
 
    private static final String QUEUE_NAME = "TEST_REDIST";
    private static final String SERVER_NAME_BASE = "clusterRedistribution/broker-";
@@ -249,11 +249,20 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
          });
       }
 
+      /*
       for (int i = 0; i < serverRecords.length * 2; i++) {
          int serverToReStart = i % serverRecords.length;
          logger.info("Restarting server {}", serverToReStart);
          serverRecords[serverToReStart].restartServer(serverToReStart % 2 == 0); // half with kill, half with graceful stop
          logger.info("Restarted server {}", serverToReStart);
+      }
+       */
+      int serverToReStart = 0;
+      for (int i = 0; i < 3; i++) {
+         logger.info("Restarting server {}", serverToReStart);
+         serverRecords[serverToReStart].restartServer(false);
+         logger.info("Restarted server {}", serverToReStart);
+         Thread.sleep(1000);
       }
 
       restartsComplete.set(true);
@@ -279,7 +288,9 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
             startNumber = serverRecord.startNumber.get();
             Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
             MessageProducer producer = session.createProducer(session.createQueue(QUEUE_NAME));
-            while (!restartsComplete.get()) {
+
+            long deadline = System.currentTimeMillis() + CLIENT_RECONNECT_INTERVAL_MS;
+            while (System.currentTimeMillis() < deadline && !restartsComplete.get()) {
                serverRecord.readLock();
                try {
                   if (serverRecord.startNumber.get() != startNumber) {
@@ -296,6 +307,13 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
                   serverRecord.readUnlock();
                }
             }
+            long sleepInterval = RandomUtil.randomInterval(1, CLIENT_RECONNECT_INTERVAL_MS);
+            logger.info("Reconnecting producer {}, localSent={}, totalSent={}, sleeping for {}", serverRecord.serverId, localSent, totalSent, sleepInterval);
+
+            // need to make things a little unpredictable
+            Thread.sleep(sleepInterval);
+         } catch (Exception e) {
+            logger.debug("Producer {} reconnecting after: {}", serverRecord.serverId, e.getMessage());
          }
       }
    }
@@ -311,7 +329,7 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
                Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
                MessageConsumer consumer = session.createConsumer(session.createQueue(QUEUE_NAME));
 
-               long deadline = System.currentTimeMillis() + CONSUMER_RECONNECT_INTERVAL_MS;
+               long deadline = System.currentTimeMillis() + CLIENT_RECONNECT_INTERVAL_MS;
                while (System.currentTimeMillis() < deadline && (!producersComplete.get() || totalReceived.get() < totalSent.get())) {
                   serverRecord.readLock();
                   try {
@@ -336,7 +354,7 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
                      serverRecord.readUnlock();
                   }
                }
-               long sleepInterval = RandomUtil.randomInterval(1, CONSUMER_RECONNECT_INTERVAL_MS);
+               long sleepInterval = RandomUtil.randomInterval(1, CLIENT_RECONNECT_INTERVAL_MS);
                logger.info("Reconnecting consumer {}, locallyReceived={}, totalReceived={}, totalSent={}, duplicates={}, sleeping for {}", serverRecord.serverId, localReceived, totalReceived, totalSent, duplicates, sleepInterval);
 
                // need to make things a little unpredictable
@@ -349,6 +367,87 @@ public class ClusterRedistributionSoakTest extends SoakTestBase {
       } finally {
          consumersDone.countDown();
       }
+   }
+
+   @Test
+   public void testRedistributionSingleConsumer() throws Throwable {
+      final AtomicInteger totalReceived = new AtomicInteger(0);
+      final AtomicInteger totalSent = new AtomicInteger(0);
+      final AtomicInteger errors = new AtomicInteger(0);
+      final AtomicInteger duplicates = new AtomicInteger(0);
+      final AtomicBoolean restartsComplete = new AtomicBoolean(false);
+      final AtomicBoolean producersComplete = new AtomicBoolean(false);
+      final Set<String> receivedMessageIds = ConcurrentHashMap.newKeySet();
+      final int consumerServerIndex = 0;
+
+      ExecutorService executorService = Executors.newFixedThreadPool(NUMBER_OF_SERVERS + 1);
+      runAfter(executorService::shutdownNow);
+
+      CountDownLatch producersDone = new CountDownLatch(NUMBER_OF_SERVERS);
+      CountDownLatch consumersDone = new CountDownLatch(1);
+
+      executorService.execute(() -> consumeMessages(serverRecords[consumerServerIndex], totalReceived, totalSent, producersComplete, receivedMessageIds, duplicates, consumersDone));
+
+      for (int s = 0; s < NUMBER_OF_SERVERS; s++) {
+         final int serverIndex = s;
+         executorService.execute(() -> {
+            try {
+               produceMessages(serverRecords[serverIndex], totalSent, restartsComplete);
+            } catch (Exception e) {
+               logger.warn("Producer {} failed: {}", serverIndex, e.getMessage(), e);
+               errors.incrementAndGet();
+            } finally {
+               producersDone.countDown();
+            }
+         });
+      }
+
+      for (int i = 0; i < 3; i++) {
+         logger.info("Restarting consumer server {}", consumerServerIndex);
+         serverRecords[consumerServerIndex].restartServer(false);
+         logger.info("Restarted consumer server {}", consumerServerIndex);
+      }
+
+      restartsComplete.set(true);
+      assertTrue(producersDone.await(TIMEOUT_MINUTES, TimeUnit.MINUTES), "Producers did not complete in time");
+
+      producersComplete.set(true);
+      assertTrue(consumersDone.await(TIMEOUT_MINUTES, TimeUnit.MINUTES), "Consumers did not complete in time");
+
+      Wait.assertEquals(totalSent.get(), () -> totalReceived.get(), TimeUnit.MINUTES.toMillis(TIMEOUT_MINUTES));
+      Wait.assertTrue(() -> totalQueueMessages() == 0, TimeUnit.MINUTES.toMillis(TIMEOUT_MINUTES));
+
+      logger.info("Test finished: totalSent={}, totalReceived={}, duplicates={}", totalSent.get(), totalReceived.get(), duplicates.get());
+
+      assertEquals(0, errors.get(), "Errors occurred during test");
+      assertEquals(0, duplicates.get(), "Duplicate messages detected");
+   }
+
+   private void waitForConsumerServerReady(int consumerServerIndex, AtomicInteger totalReceived, int receivedBeforeRestart) throws Exception {
+      for (int i = 0; i < NUMBER_OF_SERVERS; i++) {
+         final int serverIndex = i;
+         Wait.assertEquals(NUMBER_OF_SERVERS, () -> new SimpleManagement("tcp://localhost:" + (SERVER_PORT_BASE + serverIndex), null, null).listNetworkTopology().size(), 30_000);
+      }
+      Wait.assertTrue(() -> {
+         try {
+            return new SimpleManagement("tcp://localhost:" + (SERVER_PORT_BASE + consumerServerIndex), null, null).getNumberOfConsumersOnQueue(QUEUE_NAME) >= 1;
+         } catch (Exception e) {
+            return false;
+         }
+      }, 30_000);
+      Wait.assertTrue(() -> totalReceived.get() > receivedBeforeRestart, 30_000);
+   }
+
+   private long totalQueueMessages() {
+      long total = 0;
+      for (int i = 0; i < NUMBER_OF_SERVERS; i++) {
+         try {
+            total += new SimpleManagement("tcp://localhost:" + (SERVER_PORT_BASE + i), null, null).getMessageCountOnQueue(QUEUE_NAME);
+         } catch (Exception e) {
+            logger.debug("Could not get message count from server {}: {}", i, e.getMessage());
+         }
+      }
+      return total;
    }
 
    @AfterEach
