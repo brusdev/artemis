@@ -128,4 +128,34 @@ public class DeadBridgeRecordDistributionTest extends ClusterTestBase {
       assertSame(live, cc0.getRecords().get(node1Id).getBridge(),
                  "nodeUP must not replace a live connected bridge");
    }
+
+   @Test
+   @Timeout(120)
+   public void testNodeUpReplacesPendingScaleDownRecord() throws Exception {
+      startServers(0, 1);
+
+      ClusterConnectionImpl cc0 = getClusterConnection(0);
+      String node1Id = getNodeId(1);
+
+      assertTrue(Wait.waitFor(() -> {
+         MessageFlowRecord r = cc0.getRecords().get(node1Id);
+         return r != null && r.getBridge() != null && r.getBridge().isConnected();
+      }, 30_000, 100), "connected bridge required");
+
+      MessageFlowRecord pending = cc0.getRecords().get(node1Id);
+      BridgeImpl oldBridge = (BridgeImpl) pending.getBridge();
+      TopologyMember member = cc0.getTopology().getMember(node1Id);
+      assertNotNull(member);
+
+      logger.debug("Marking flow record pending scale-down to simulate long SnF drain");
+      pending.markPendingScaleDown();
+      assertTrue(pending.isPendingScaleDown());
+
+      cc0.nodeUP(member, true);
+
+      assertTrue(Wait.waitFor(() -> {
+         MessageFlowRecord r = cc0.getRecords().get(node1Id);
+         return r != null && r.getBridge() != null && r.getBridge() != oldBridge && r.getBridge().isConnected();
+      }, 30_000, 100), "nodeUP must replace a pending scale-down record and connect a new bridge");
+   }
 }

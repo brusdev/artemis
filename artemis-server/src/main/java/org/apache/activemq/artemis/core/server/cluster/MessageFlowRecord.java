@@ -40,4 +40,16 @@ public interface MessageFlowRecord extends MessageHandler {
     * Enable or disable all remote bindings owned by this flow record for address routing.
     */
    void setBindingsEnabled(boolean enabled);
+
+   /**
+    * Mark this record as undergoing SnF scale-down so {@code nodeUP} may replace it while the
+    * drain runs. A long drain must not block topology rejoin from creating a live bridge.
+    */
+   void markPendingScaleDown();
+
+   /**
+    * {@return true if {@link #markPendingScaleDown()} was called and the record should be treated
+    * as dead for {@code nodeUP} replacement}
+    */
+   boolean isPendingScaleDown();
 }

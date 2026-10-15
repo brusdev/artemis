@@ -429,14 +429,42 @@ public class ClusterConnectionBridge extends BridgeImpl {
 
    @Override
    protected void beforeScaleDownRelocate() {
+      // Anticipate notifyNodeDown before the SnF drain so fail() after the drain does not need
+      // a wall-clock notify (that can fence a rejoin via Topology.mapDelete).
+      // Use the departed activation's event UID + 1 (Topology's shutdown convention), not
+      // currentTimeMillis: if the target already rejoined, removeMember ignores this as stale.
+      if (targetNodeID != null && clusterConnection.isCurrentBridge(targetNodeID, this)
+         && (flowRecord == null || !flowRecord.isPendingScaleDown())) {
+         disconnectedAndDown = true;
+         getServerLocator().notifyNodeDown(targetNodeEventUID + 1, targetNodeID);
+         logger.debug("Early notifyNodeDown for {} before SnF scale-down drain (eventUID={})",
+            targetNodeID, targetNodeEventUID + 1);
+      }
       if (flowRecord != null) {
+         // Fence ingress, then mark replaceable so a concurrent nodeUP can install a live
+         // bridge while this drain runs.
          flowRecord.setBindingsEnabled(false);
+         flowRecord.markPendingScaleDown();
       }
    }
 
    @Override
+   protected boolean shouldAbortScaleDownDrain() {
+      return targetNodeID == null || !clusterConnection.isCurrentBridge(targetNodeID, this);
+   }
+
+   @Override
    protected boolean shouldNotifyNodeDownOnFail() {
-      return targetNodeID != null && clusterConnection.isCurrentBridge(targetNodeID, this);
+      if (targetNodeID == null || !clusterConnection.isCurrentBridge(targetNodeID, this)) {
+         return false;
+      }
+      // Already notified at beforeScaleDownRelocate(); a second notify at drain completion
+      // would race a possible rejoin.
+      if (flowRecord != null && flowRecord.isPendingScaleDown()) {
+         logger.debug("Skipping notifyNodeDown for {}; already notified before scale-down drain", targetNodeID);
+         return false;
+      }
+      return true;
    }
 
    @Override
@@ -452,9 +480,21 @@ public class ClusterConnectionBridge extends BridgeImpl {
 
       if (permanently) {
          logger.debug("cluster node for bridge {} is permanently down", this.getName());
-         final boolean removedOurs = clusterConnection.removeRecord(targetNodeID, this, scaleDown);
+         final boolean rejoined = targetNodeAlreadyRejoined();
+         // Pending scale-down: recreate only if the target already rejoined. Otherwise skip
+         // recreate (avoid bridging to a stale topology member) and allow SnF delete when empty.
+         final boolean effectiveScaleDown;
+         if (flowRecord != null && flowRecord.isPendingScaleDown()) {
+            effectiveScaleDown = !rejoined;
+            if (rejoined) {
+               logger.debug("Target {} rejoined during scale-down; removing record with recreate", targetNodeID);
+            }
+         } else {
+            effectiveScaleDown = scaleDown;
+         }
+         final boolean removedOurs = clusterConnection.removeRecord(targetNodeID, this, effectiveScaleDown);
 
-         if (scaleDown && removedOurs) {
+         if (effectiveScaleDown && removedOurs) {
             final Queue snfQueue = queue;
             final String nodeId = targetNodeID;
             final ClusterConnectionImpl cc = (ClusterConnectionImpl) clusterConnection;
@@ -485,5 +525,13 @@ public class ClusterConnectionBridge extends BridgeImpl {
       } else {
          clusterConnection.disconnectRecord(targetNodeID);
       }
+   }
+
+   private boolean targetNodeAlreadyRejoined() {
+      if (targetNodeID == null) {
+         return false;
+      }
+      TopologyMember member = clusterConnection.getTopology().getMember(targetNodeID);
+      return member != null && member.getPrimary() != null;
    }
 }

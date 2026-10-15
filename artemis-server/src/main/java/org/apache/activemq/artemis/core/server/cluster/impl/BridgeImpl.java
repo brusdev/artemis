@@ -125,6 +125,12 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
    // upon reconnection we need to send the nodeUP back into the topology
    protected volatile boolean disconnectedAndDown = false;
 
+   /**
+    * Topology down event captured when the connection fails (memberUID+1). Must not be recomputed
+    * later in {@link #fail(boolean, boolean)} after a concurrent rejoin updated {@link #targetNode}.
+    */
+   private volatile long failureTopologyEventID;
+
    protected String targetNodeID;
 
    protected TopologyMember targetNode;
@@ -725,6 +731,9 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          }
       }
 
+      // Capture before scale-down / topology gossip can replace targetNode with a rejoined member.
+      failureTopologyEventID = targetNode != null ? targetNode.getUniqueEventID() + 1 : System.currentTimeMillis();
+
       synchronized (connectionGuard) {
          keepConnecting = true;
       }
@@ -768,10 +777,22 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          final SimpleString targetSuffix = SimpleString.of(scaleDownTargetNodeID);
          int iteration = 0;
          while (iteration < MAX_SCALE_DOWN_DRAIN_ITERATIONS && !snf.isEmptyForScaleDown()) {
+            if (shouldAbortScaleDownDrain()) {
+               logger.debug("Aborting scale-down drain for {}; flow record was replaced", getName());
+               // Clean up this bridge only; removeRecord is skipped when no longer current.
+               fail(true, false);
+               return;
+            }
             iteration++;
             int moved = snf.moveReferencesBetweenSnFQueues(targetSuffix);
             logger.debug("scale-down drain iteration={} queue={} moved={} empty={}",
                          iteration, snf.getName(), moved, snf.isEmptyForScaleDown());
+         }
+
+         if (shouldAbortScaleDownDrain()) {
+            logger.debug("Aborting scale-down finish for {}; flow record was replaced", getName());
+            fail(true, false);
+            return;
          }
 
          if (!snf.isEmptyForScaleDown()) {
@@ -796,6 +817,13 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
     * Hook for cluster bridges to fence departing remote bindings before SnF relocate.
     */
    protected void beforeScaleDownRelocate() {
+   }
+
+   /**
+    * Hook for cluster bridges: abort relocate when {@code nodeUP} already replaced this bridge.
+    */
+   protected boolean shouldAbortScaleDownDrain() {
+      return false;
    }
 
    private static final int MAX_SCALE_DOWN_DRAIN_ITERATIONS = 10;
@@ -927,7 +955,13 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       //we need to make sure we remove the node from the topology so any incoming quorum requests are voted correctly
       if (shouldNotifyNodeDownOnFail()) {
          this.disconnectedAndDown = true;
-         serverLocator.notifyNodeDown(System.currentTimeMillis(), targetNodeID);
+         // Prefer the event id captured at connection-fail time. Topology treats shutdown as
+         // memberUID+1; wall-clock would let a late scale-down fail remove a rejoined member.
+         long downEventID = failureTopologyEventID;
+         if (downEventID <= 0) {
+            downEventID = targetNode != null ? targetNode.getUniqueEventID() + 1 : System.currentTimeMillis();
+         }
+         serverLocator.notifyNodeDown(downEventID, targetNodeID);
       }
       if (queue != null) {
          try {
@@ -954,6 +988,7 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
                                     new Pair<>(targetNode.getPrimary(), targetNode.getBackup()), false);
          disconnectedAndDown = false;
       }
+      failureTopologyEventID = 0;
       retryCount = 0;
       reconnectAttemptsInUse = configuration.getReconnectAttempts();
       if (scheduledReconnection != null) {

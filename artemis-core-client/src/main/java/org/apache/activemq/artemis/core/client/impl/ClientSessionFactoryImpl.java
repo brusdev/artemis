@@ -160,6 +160,12 @@ public class ClientSessionFactoryImpl implements ClientSessionFactoryInternal, C
 
    private String primaryNodeID;
 
+   /**
+    * Topology uniqueEventID observed for {@link #primaryNodeID} when this factory attached. Used so a
+    * late {@code nodeDisconnected} cannot notifyNodeDown a newer activation of the same node.
+    */
+   private volatile long primaryTopologyEventID;
+
    // We need to cache this value here since some listeners may be registered after connectionReadyForWrites was called.
    private boolean connectionReadyForWrites;
 
@@ -1520,7 +1526,20 @@ public class ClientSessionFactoryImpl implements ClientSessionFactoryInternal, C
                          serverLocator, nodeID, reason, new Exception("trace"));
          }
 
-         serverLocator.notifyNodeDown(System.currentTimeMillis(), nodeID, true);
+         // Prefer the topology event from when this factory attached. Using the live member's UID
+         // (or wall-clock) lets a late disconnect during SnF scale-down remove a rejoined node.
+         TopologyMemberImpl memberForDown = serverLocator.getTopology().getMember(nodeID);
+         if (memberForDown != null && primaryTopologyEventID > 0
+            && memberForDown.getUniqueEventID() > primaryTopologyEventID) {
+            logger.debug("Skipping stale nodeDisconnected notifyNodeDown for {}; topology event {} > attached {}",
+                         nodeID, memberForDown.getUniqueEventID(), primaryTopologyEventID);
+         } else {
+            long downEventID = primaryTopologyEventID > 0 ? primaryTopologyEventID + 1 : System.currentTimeMillis();
+            if (primaryTopologyEventID <= 0 && memberForDown != null) {
+               downEventID = memberForDown.getUniqueEventID() + 1;
+            }
+            serverLocator.notifyNodeDown(downEventID, nodeID, true);
+         }
 
          if (reason.isRedirect()) {
             if (serverLocator.isHA()) {
@@ -1558,6 +1577,7 @@ public class ClientSessionFactoryImpl implements ClientSessionFactoryInternal, C
                // if it is our connector then set the primary id used for failover
                if (connectorPair.getA() != null && TransportConfigurationUtil.isSameHost(connectorPair.getA(), currentConnectorConfig)) {
                   primaryNodeID = nodeID;
+                  primaryTopologyEventID = uniqueEventID;
                }
 
                serverLocator.notifyNodeUp(uniqueEventID, nodeID, backupGroupName, scaleDownGroupName, connectorPair, isLast);

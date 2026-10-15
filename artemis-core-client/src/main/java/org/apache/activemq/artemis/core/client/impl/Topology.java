@@ -218,6 +218,8 @@ public final class Topology {
             }
             memberInput.setUniqueEventID(uniqueEventID);
             topology.put(nodeId, memberInput);
+            // Drop any prior delete fence once this activation is accepted.
+            getMapDelete().remove(nodeId);
             sendMemberUp(nodeId, memberInput);
             return true;
          }
@@ -245,6 +247,7 @@ public final class Topology {
 
             topology.remove(nodeId);
             topology.put(nodeId, newMember);
+            getMapDelete().remove(nodeId);
             sendMemberUp(nodeId, newMember);
 
             return true;

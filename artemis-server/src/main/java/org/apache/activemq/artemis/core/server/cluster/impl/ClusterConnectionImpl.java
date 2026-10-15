@@ -982,10 +982,13 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
             } else {
                Bridge existingBridge = record.getBridge();
                boolean bridgeDead = record.isClosed()
+                  || record.isPendingScaleDown()
                   || existingBridge == null
                   || isBridgeLocatorClosed(existingBridge);
                if (bridgeDead) {
-                  logger.debug("{}::Replacing dead flow record for nodeID={}", this, nodeID);
+                  logger.debug("{}::Replacing dead flow record for nodeID={} (closed={}, pendingScaleDown={}, locatorClosed={})",
+                     this, nodeID, record.isClosed(), record.isPendingScaleDown(),
+                     isBridgeLocatorClosed(existingBridge));
                   records.remove(nodeID);
                   deadRecord = record;
                   deadBridge = existingBridge;
@@ -1191,6 +1194,8 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       private final Map<SimpleString, RemoteQueueBinding> bindings = new HashMap<>();
 
       private volatile boolean isClosed = false;
+
+      private volatile boolean pendingScaleDown = false;
 
       private volatile boolean reset = false;
 
@@ -1501,6 +1506,16 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
          for (RemoteQueueBinding binding : bindings.values()) {
             binding.setEnabled(enabled);
          }
+      }
+
+      @Override
+      public void markPendingScaleDown() {
+         pendingScaleDown = true;
+      }
+
+      @Override
+      public boolean isPendingScaleDown() {
+         return pendingScaleDown;
       }
 
       private synchronized void doBindingUpdated(final ClientMessage message) throws Exception {
