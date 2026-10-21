@@ -761,6 +761,19 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       statusLock.lock();
       try {
          beforeScaleDownRelocate();
+
+         // Return any in-flight references (messages this bridge had started forwarding but
+         // never got confirmation for before the connection dropped) to the SnF queue BEFORE
+         // draining. These references are held in the bridge's own refs map and are counted by
+         // getMessageCount() but are NOT part of the queue's deliverable references, so the
+         // drain loop below (which iterates deliverable references via moveReferencesBetweenSnFQueues)
+         // cannot see them. Without this, isEmptyForScaleDown() stays false forever, the drain
+         // gives up after MAX_SCALE_DOWN_DRAIN_ITERATIONS, and the in-flight message is stranded
+         // on a queue targeting the departing node and ultimately lost. We hold statusLock for the
+         // whole method and handle() needs statusLock.tryLock(), so cancelled references cannot be
+         // re-grabbed by this (now dead) bridge during the drain.
+         cancelRefs();
+
          if (logger.isDebugEnabled()) {
             logger.debug("Moving {} messages from {} to {}", queue.getMessageCount(), queue.getName(), scaleDownTargetNodeID);
          }
