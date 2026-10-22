@@ -51,11 +51,9 @@ import org.apache.activemq.artemis.core.server.ActiveMQMessageBundle;
 import org.apache.activemq.artemis.core.server.ActiveMQServer;
 import org.apache.activemq.artemis.core.server.ActiveMQServerLogger;
 import org.apache.activemq.artemis.core.server.ComponentConfigurationRoutingType;
-import org.apache.activemq.artemis.core.server.MessageReference;
 import org.apache.activemq.artemis.core.server.Queue;
 import org.apache.activemq.artemis.core.server.cluster.ActiveMQServerSideProtocolManagerFactory;
 import org.apache.activemq.artemis.core.server.impl.QueueImpl;
-import org.apache.activemq.artemis.utils.collections.LinkedListIterator;
 import org.apache.activemq.artemis.core.server.cluster.ClusterConnection;
 import org.apache.activemq.artemis.core.server.cluster.ClusterManager;
 import org.apache.activemq.artemis.core.server.cluster.MessageFlowRecord;
@@ -441,27 +439,6 @@ public class ClusterConnectionBridge extends BridgeImpl {
       return targetNodeID != null && clusterConnection.isCurrentBridge(targetNodeID, this);
    }
 
-   /**
-    * SCALEDOWN-TRACE: dump every reference still present in an SnF queue immediately before it is
-    * deleted on the scale-down path. On this (removeRecord scaleDown=true) path the ingress bindings
-    * are never disabled, so a message routed concurrently can land here after the empty-check and be
-    * destroyed by deleteQueue. Any message logged here with no later redelivery is the exact drop.
-    */
-   private void traceSnFDeleteContents(Queue snfQueue) {
-      if (snfQueue.getMessageCount() == 0) {
-         return;
-      }
-      try (LinkedListIterator<MessageReference> it = snfQueue.browserIterator()) {
-         while (it.hasNext()) {
-            MessageReference ref = it.next();
-            logger.warn("SCALEDOWN-TRACE DROP (race: message in SnF queue at delete) queue={} msg={}",
-                        snfQueue.getName(), ref.getMessage());
-         }
-      } catch (Throwable t) {
-         logger.warn("SCALEDOWN-TRACE failed to browse {} before delete: {}", snfQueue.getName(), t.toString());
-      }
-   }
-
    @Override
    protected void fail(final boolean permanently, final boolean scaleDown) {
       logger.debug("Cluster Bridge {} failed, permanently={}", this.getName(), permanently);
@@ -492,18 +469,9 @@ public class ClusterConnectionBridge extends BridgeImpl {
                if (snfQueue instanceof QueueImpl qi && !qi.isEmptyForScaleDown()) {
                   ActiveMQServerLogger.LOGGER.scaleDownSkipNonEmptySnfDelete(
                      snfQueue.getName().toString(), snfQueue.getMessageCount());
-                  logger.debug("SCALEDOWN-TRACE snf-delete SKIP (non-empty) queue={} count={}",
-                               snfQueue.getName(), snfQueue.getMessageCount());
                   return;
                }
-               // SCALEDOWN-TRACE QUICK-CHECK (Option D): skip the SnF deleteQueue entirely and always
-               // retain the queue, to verify this eliminates the teardown loss. Nothing is destroyed,
-               // so no ref (present-at-delete or arriving after) can be killed/orphaned.
-               traceSnFDeleteContents(snfQueue);
-               logger.debug("SCALEDOWN-TRACE snf-delete SKIP-ALL (Option D quick-check, retaining queue) queue={} count={}", snfQueue.getName(), snfQueue.getMessageCount());
-               if (true) {
-                  return;
-               }
+               logger.debug("Scaling down queue {}", snfQueue);
                try {
                   snfQueue.deleteQueue(true);
                   snfQueue.removeAddress();

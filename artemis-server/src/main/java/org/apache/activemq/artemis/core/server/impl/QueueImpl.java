@@ -145,14 +145,6 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
    protected static final int CRITICAL_CHECK_DEPAGE = 4;
 
    private static final Logger logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
-
-   /**
-    * SCALEDOWN-TRACE: dedicated logger for SnF scale-down relocate decisions. Its name sits under
-    * {@code org.apache.activemq.artemis.core.server.cluster} so it is captured by the same DEBUG
-    * category the scale-down soak test enables, without turning on the (very chatty) QueueImpl logger.
-    */
-   private static final Logger snfRelocateLogger =
-      LoggerFactory.getLogger("org.apache.activemq.artemis.core.server.cluster.SnFRelocate");
    private static final AtomicIntegerFieldUpdater<QueueImpl> dispatchingUpdater = AtomicIntegerFieldUpdater.newUpdater(QueueImpl.class, "dispatching");
    private static final AtomicLongFieldUpdater<QueueImpl> dispatchStartTimeUpdater = AtomicLongFieldUpdater.newUpdater(QueueImpl.class, "dispatchStartTime");
    private static final AtomicLongFieldUpdater<QueueImpl> consumerRemovedTimestampUpdater = AtomicLongFieldUpdater.newUpdater(QueueImpl.class, "consumerRemovedTimestamp");
@@ -1014,14 +1006,6 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
    public void addTail(final MessageReference ref, final boolean direct) {
       if (logger.isTraceEnabled()) {
          logger.trace("AddTail on queue {}, reference={}", this.getName(), ref);
-      }
-      // SCALEDOWN-TRACE: a message routed into an SnF queue AFTER the queue was destroyed (the
-      // ingress race on the removeRecord/scale-down teardown path) lands in a dead queue's refs:
-      // it is never delivered, never relocated, and is orphaned in the journal. queueDestroyed is a
-      // cheap volatile read, so this only does extra work in the (rare) post-destroy window.
-      if (queueDestroyed && queueConfiguration.isInternal() && getName().toString().contains(".sf.")) {
-         snfRelocateLogger.warn("SCALEDOWN-TRACE DROP (addTail to destroyed SnF queue) queue={} msg={} callPath:",
-                                getName(), ref.getMessage(), new Throwable("addTail-to-destroyed call path"));
       }
       try (ArtemisCloseable metric = measureCritical(CRITICAL_PATH_ADD_TAIL)) {
          if (scheduleIfPossible(ref)) {
@@ -2035,18 +2019,9 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
    }
 
    QueueIterateAction createDeleteMatchingAction(AckReason ackReason) {
-      // SCALEDOWN-TRACE: SnF internal queues should never have their references destroyed by a plain
-      // delete during normal operation; if they do (e.g. a scale-down deleteQueue racing a concurrent
-      // ingress), each discarded message is a lost cluster message. Log them so the drop is caught.
-      final boolean snfQueue = queueConfiguration.isInternal()
-         && getName().toString().contains(".sf.");
       return new QueueIterateAction() {
          @Override
          public boolean actMessage(Transaction tx, MessageReference ref) throws Exception {
-            if (snfQueue) {
-               snfRelocateLogger.warn("SCALEDOWN-TRACE DROP (deleteQueue destroying SnF ref) queue={} ackReason={} msg={}",
-                                      getName(), ackReason, ref.getMessage());
-            }
             incDelivering(ref);
             acknowledge(tx, ref, ackReason, null, true);
             return true;
@@ -3567,8 +3542,7 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
       if (oldRouteToIDs == null) {
          // No directed route metadata: treat as anycast-style rediscovery via full route
          logger.debug("No HDR_ROUTE_TO_IDS on SnF message {}; falling back to postOffice.route", ref);
-         RoutingStatus status = postOffice.route(copyMessage, new RoutingContextImpl(tx), false);
-         traceSnFRelocateOutcome("no-route-metadata-fallback", queueSuffix, ref, copyMessage, status);
+         postOffice.route(copyMessage, new RoutingContextImpl(tx), false);
          finishSnFMove(tx, ref);
          return true;
       }
@@ -3598,7 +3572,6 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
       }
 
       if (!hadMiss) {
-         traceSnFRelocateTargets("directed", queueSuffix, ref, copyMessage, routingContext);
          postOffice.processRoute(copyMessage, routingContext, false);
          finishSnFMove(tx, ref);
          return true;
@@ -3624,7 +3597,6 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
                logger.debug("No remaining binding for multicast routing name of queueID {}", oldQueueID);
             }
          }
-         traceSnFRelocateTargets("multicast-miss", queueSuffix, ref, copyMessage, routingContext);
          postOffice.processRoute(copyMessage, routingContext, false);
          finishSnFMove(tx, ref);
          return true;
@@ -3632,41 +3604,9 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
 
       // Anycast: full postOffice.route as if newly received (honors NO_BINDINGS / DLA policy)
       logger.debug("Anycast SnF relocate miss; falling back to postOffice.route for {}", copyMessage);
-      RoutingStatus status = postOffice.route(copyMessage, new RoutingContextImpl(tx), false);
-      traceSnFRelocateOutcome("anycast-miss-fallback", queueSuffix, ref, copyMessage, status);
+      postOffice.route(copyMessage, new RoutingContextImpl(tx), false);
       finishSnFMove(tx, ref);
       return true;
-   }
-
-   /**
-    * SCALEDOWN-TRACE: log the outcome of a {@link PostOffice#route} fallback during SnF relocate.
-    * A {@link RoutingStatus#NO_BINDINGS} means the copy was dropped while the original reference is
-    * about to be acked by {@link #finishSnFMove} — i.e. the message is lost.
-    */
-   private void traceSnFRelocateOutcome(String path, SimpleString queueSuffix, MessageReference ref, Message copyMessage, RoutingStatus status) {
-      if (status == RoutingStatus.NO_BINDINGS || status == RoutingStatus.NO_BINDINGS_DLA) {
-         snfRelocateLogger.warn("SCALEDOWN-TRACE DROP path={} queue={} target={} status={} msg={}",
-                                path, getName(), queueSuffix, status, copyMessage);
-      } else if (snfRelocateLogger.isDebugEnabled()) {
-         snfRelocateLogger.debug("SCALEDOWN-TRACE relocate path={} queue={} target={} status={} msg={}",
-                                 path, getName(), queueSuffix, status, copyMessage);
-      }
-   }
-
-   /**
-    * SCALEDOWN-TRACE: log how many targets a directed/multicast relocate resolved to. Zero targets
-    * means {@link PostOffice#processRoute} will persist the copy against no queues while the original
-    * reference is acked by {@link #finishSnFMove} — i.e. the message is lost.
-    */
-   private void traceSnFRelocateTargets(String path, SimpleString queueSuffix, MessageReference ref, Message copyMessage, RoutingContext routingContext) {
-      int targets = routingContext.getQueueCount();
-      if (targets == 0) {
-         snfRelocateLogger.warn("SCALEDOWN-TRACE DROP path={} queue={} target={} targets=0 msg={}",
-                                path, getName(), queueSuffix, copyMessage);
-      } else if (snfRelocateLogger.isDebugEnabled()) {
-         snfRelocateLogger.debug("SCALEDOWN-TRACE relocate path={} queue={} target={} targets={} msg={}",
-                                 path, getName(), queueSuffix, targets, copyMessage);
-      }
    }
 
    private void finishSnFMove(final Transaction tx, final MessageReference ref) throws Exception {
