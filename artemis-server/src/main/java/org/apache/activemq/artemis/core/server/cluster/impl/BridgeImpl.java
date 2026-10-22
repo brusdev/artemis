@@ -288,7 +288,7 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       return toString();
    }
 
-   private void cancelRefs() {
+   private List<MessageReference> cancelRefs() {
       LinkedList<MessageReference> list;
 
       synchronized (refs) {
@@ -300,9 +300,9 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          logger.trace("BridgeImpl::cancelRefs cancelling {} references", list.size());
       }
 
-      if (logger.isTraceEnabled() && list.isEmpty()) {
+      if (list.isEmpty()) {
          logger.trace("didn't have any references to cancel on bridge {}", this);
-         return;
+         return list;
       }
 
       ListIterator<MessageReference> listIterator = list.listIterator(list.size());
@@ -325,6 +325,8 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
             ActiveMQServerLogger.LOGGER.errorCancellingRefOnBridge(ref, e);
          }
       }
+
+      return list;
    }
 
    @Override
@@ -744,10 +746,16 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       }
 
       if (scaleDownTargetNodeID != null && !scaleDownTargetNodeID.equals(nodeUUID.toString())) {
+         onScaleDown(scaleDownTargetNodeID);
          scaleDown(scaleDownTargetNodeID);
       } else if (scaleDownTargetNodeID != null) {
          // the disconnected node is scaling down to me, no need to reconnect to it
          logger.debug("Received scaleDownTargetNodeID: {}; cancelling reconnect.", scaleDownTargetNodeID);
+         // Fence SnF ingress BEFORE tearing the record down so the post office stops routing new
+         // messages into the SnF queue. The queue is then retained (not deleted) on fail(true, true);
+         // the lazy SnF reaper relocates any residual to the scale-down target and deletes it once idle.
+         onScaleDown(scaleDownTargetNodeID);
+         beforeScaleDownRelocate();
          fail(true, true);
       } else {
          logger.debug("Received null scaleDownTargetNodeID");
@@ -757,10 +765,20 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       tryScheduleRetryReconnect(me.getType());
    }
 
+   /**
+    * Hook invoked when the remote node announces it is scaling down (with a non-null scale-down
+    * target). Overridden by {@link ClusterConnectionBridge} to record the target for the lazy SnF
+    * reaper. Default is a no-op.
+    */
+   protected void onScaleDown(String scaleDownTargetNodeID) {
+   }
+
    protected void scaleDown(String scaleDownTargetNodeID) {
       statusLock.lock();
       try {
          beforeScaleDownRelocate();
+
+         final QueueImpl snf = (QueueImpl) queue;
 
          // Return any in-flight references (messages this bridge had started forwarding but
          // never got confirmation for before the connection dropped) to the SnF queue BEFORE
@@ -777,7 +795,6 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          if (logger.isDebugEnabled()) {
             logger.debug("Moving {} messages from {} to {}", queue.getMessageCount(), queue.getName(), scaleDownTargetNodeID);
          }
-         final QueueImpl snf = (QueueImpl) queue;
          final SimpleString targetSuffix = SimpleString.of(scaleDownTargetNodeID);
          int iteration = 0;
          while (iteration < MAX_SCALE_DOWN_DRAIN_ITERATIONS && !snf.isEmptyForScaleDown()) {
@@ -790,12 +807,10 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          if (!snf.isEmptyForScaleDown()) {
             ActiveMQServerLogger.LOGGER.scaleDownDrainIncomplete(
                MAX_SCALE_DOWN_DRAIN_ITERATIONS, snf.getName().toString(), snf.getMessageCount());
-            // Permanent fail without SnF delete so residual messages are retained
-            fail(true, false);
-            return;
          }
 
-         // stop the bridge from trying to reconnect and clean up all the bindings
+         // Permanently fail the bridge; the SnF queue is retained (not deleted) and any residual is
+         // relocated/reaped later by the lazy SnF reaper in ClusterConnectionImpl.
          fail(true, true);
 
       } catch (Exception e) {

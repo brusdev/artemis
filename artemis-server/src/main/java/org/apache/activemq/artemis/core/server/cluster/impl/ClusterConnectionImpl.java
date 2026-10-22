@@ -33,6 +33,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.activemq.artemis.api.core.ActiveMQAddressDoesNotExistException;
 import org.apache.activemq.artemis.api.core.ActiveMQException;
 import org.apache.activemq.artemis.api.core.DiscoveryGroupConfiguration;
 import org.apache.activemq.artemis.api.core.Pair;
@@ -65,6 +66,7 @@ import org.apache.activemq.artemis.core.server.ActiveMQServer;
 import org.apache.activemq.artemis.core.server.ActiveMQServerLogger;
 import org.apache.activemq.artemis.core.server.NodeManager;
 import org.apache.activemq.artemis.core.server.Queue;
+import org.apache.activemq.artemis.core.server.impl.QueueImpl;
 import org.apache.activemq.artemis.core.server.cluster.ActiveMQServerSideProtocolManagerFactory;
 import org.apache.activemq.artemis.core.server.cluster.Bridge;
 import org.apache.activemq.artemis.core.server.cluster.ClusterConnection;
@@ -145,6 +147,20 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
    final Object recordsGuard = new Object();
 
    private final Map<String, MessageFlowRecord> records = new ConcurrentHashMap<>();
+
+   // Lazy SnF reaper (see snf-scaledown-deletequeue-inflight-ref-race / -reaper-implementation docs).
+   // On scale-down teardown the SnF queue toward a departing node is retained (not deleted inline,
+   // which would race the deferred addTail of an in-flight route and lose messages). This reaper
+   // removes a retained, owner-less SnF queue once it has been idle across the grace interval,
+   // relocating any residual to the scale-down target first.
+   // TODO config wiring: expose period/grace as cluster-connection settings (currently constants).
+   private static final long SCALE_DOWN_REAPER_PERIOD = 5000;
+   private static final int SCALE_DOWN_REAPER_GRACE_TICKS = 2;
+   // Per departed-nodeID reaper bookkeeping, cleared when a record for that node is (re)created or its
+   // SnF queue is reaped. In-memory only: a graceful local shutdown forwards retained SnF contents via
+   // ScaleDownHandler, so no durable record is needed.
+   private final Map<String, SnFReapState> snfReapStates = new ConcurrentHashMap<>();
+   private SnFReaper snfReaper;
 
    private final ScheduledExecutorService scheduledExecutor;
 
@@ -448,6 +464,14 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
          stopping = false;
          started = true;
          activate();
+
+         if (SCALE_DOWN_REAPER_PERIOD > 0 && snfReaper == null) {
+            // initialDelay == period acts as the startup-settle window: right after start the records
+            // map is empty, so give the cluster time to reform before the reaper judges ownership.
+            snfReaper = new SnFReaper(scheduledExecutor, executor, SCALE_DOWN_REAPER_PERIOD,
+                                      SCALE_DOWN_REAPER_PERIOD, TimeUnit.MILLISECONDS);
+            snfReaper.start();
+         }
       }
 
    }
@@ -477,6 +501,11 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
       if (topologyScanner != null) {
          topologyScanner.stop();
+      }
+
+      if (snfReaper != null) {
+         snfReaper.stop();
+         snfReaper = null;
       }
 
       if (logger.isDebugEnabled()) {
@@ -1029,6 +1058,12 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
       if (queueBinding != null) {
          queue = (Queue) queueBinding.getBindable();
+         // The owner is back: cancel any pending lazy-reap of its retained SnF queue and reuse it. This
+         // runs under recordsGuard (as does the reaper's records.containsKey re-check), so (re)creating
+         // the record here prevents a pending reap from a later tick.
+         if (snfReapStates.remove(nodeID) != null) {
+            logger.debug("Reusing SnF queue {} for returning node {}; cancelling pending reap", queueName, nodeID);
+         }
       } else {
          // Add binding in storage so the queue will get reloaded on startup and we can find it - it's never
          // actually routed to at that address though
@@ -1040,6 +1075,136 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       queue.setInternalQueue(true);
 
       createNewRecord(topologyMember.getUniqueEventID(), nodeID, topologyMember.getPrimary(), queueName, queue, true);
+   }
+
+   /**
+    * Record where a departing node scaled down to, so the lazy SnF reaper can relocate any residual
+    * references in this node's SnF queue toward that node before deleting it. In-memory only; see the
+    * reaper implementation doc for why no durable persistence is required.
+    */
+   public void registerScaleDownTarget(String departedNodeID, String scaleDownTargetNodeID) {
+      if (departedNodeID != null && scaleDownTargetNodeID != null) {
+         snfReapStates.computeIfAbsent(departedNodeID, k -> new SnFReapState()).scaleDownTarget = scaleDownTargetNodeID;
+      }
+   }
+
+   /**
+    * Per-node reaper bookkeeping, keyed by departed nodeID in {@link #snfReapStates}. Fields have
+    * different concurrency disciplines:
+    * <ul>
+    *   <li>{@code scaleDownTarget} — volatile; set by {@link #registerScaleDownTarget} (teardown
+    *       thread), read by the reaper.</li>
+    *   <li>{@code eligibleTicks} — touched only on the reaper thread (the cluster connection's ordered
+    *       executor), so it needs no synchronization.</li>
+    * </ul>
+    */
+   private static final class SnFReapState {
+      volatile String scaleDownTarget;
+      int eligibleTicks;
+   }
+
+   /**
+    * Periodic task that reaps retained, owner-less SnF queues. Runs on the cluster-connection
+    * scheduled executor; all work is on a single (ordered) thread so {@link SnFReapState#eligibleTicks}
+    * needs no synchronization.
+    */
+   private final class SnFReaper extends ActiveMQScheduledComponent {
+
+      SnFReaper(ScheduledExecutorService scheduledExecutorService, Executor executor, long initialDelay, long period, TimeUnit timeUnit) {
+         super(scheduledExecutorService, executor, initialDelay, period, timeUnit, false);
+      }
+
+      @Override
+      public void run() {
+         if (stopping || !started) {
+            return;
+         }
+         try {
+            reapSnFQueues();
+         } catch (Throwable t) {
+            logger.debug("SnF reaper run failed", t);
+         }
+      }
+   }
+
+   /**
+    * One reaper pass: find this cluster connection's SnF queues whose target node is gone (no flow
+    * record, not in topology), and once a queue has been owner-less across the grace interval either
+    * relocate its residual to the recorded scale-down target or delete it when empty. See the
+    * snf-scaledown-deletequeue-inflight-ref-race / -reaper-implementation docs.
+    */
+   private void reapSnFQueues() throws Exception {
+      final String prefix = storeAndForwardPrefix + name + ".";
+      final Map<String, QueueImpl> candidates = new HashMap<>();
+      postOffice.getAllBindings().forEach(binding -> {
+         if (binding.getBindable() instanceof QueueImpl qi) {
+            final String queueName = qi.getName().toString();
+            if (queueName.startsWith(prefix)) {
+               candidates.put(queueName.substring(prefix.length()), qi);
+            }
+         }
+      });
+
+      // drop state for queues that no longer exist
+      snfReapStates.keySet().retainAll(candidates.keySet());
+
+      for (Map.Entry<String, QueueImpl> entry : candidates.entrySet()) {
+         final String nodeID = entry.getKey();
+         final QueueImpl snf = entry.getValue();
+         final SnFReapState state = snfReapStates.computeIfAbsent(nodeID, k -> new SnFReapState());
+
+         final boolean ownerLess = !records.containsKey(nodeID) && topology.getMember(nodeID) == null;
+         if (!ownerLess) {
+            // reset the grace counter but keep any recorded scale-down target for a transient blip
+            state.eligibleTicks = 0;
+            continue;
+         }
+
+         if (++state.eligibleTicks < SCALE_DOWN_REAPER_GRACE_TICKS) {
+            continue;
+         }
+
+         reapOne(nodeID, snf, state);
+      }
+   }
+
+   private void reapOne(final String nodeID, final QueueImpl snf, final SnFReapState state) throws Exception {
+      final boolean empty = snf.isEmptyForScaleDown();
+      final String target = state.scaleDownTarget;
+
+      if (!empty && target == null) {
+         // Non-empty with no known scale-down target (plain disconnect, or cache lost on a crash):
+         // retain for the owner's reconnection / the local broker's own scaleDownSNF at shutdown.
+         return;
+      }
+
+      // Re-check ownership under recordsGuard so a concurrent nodeUP (createFlowRecord, also under
+      // recordsGuard) cannot reuse a queue we are about to delete. The heavyweight delete/relocate runs
+      // OUTSIDE the guard to avoid the recordsGuard <-> bridge-statusLock / queue-monitor deadlock (see
+      // the closeRecordAndFlush-outside-recordsGuard precedent).
+      synchronized (recordsGuard) {
+         if (records.containsKey(nodeID)) {
+            snfReapStates.remove(nodeID);
+            return;
+         }
+      }
+
+      if (empty) {
+         try {
+            logger.debug("Reaping idle SnF queue {} for departed node {}", snf.getName(), nodeID);
+            snf.deleteQueue(true);
+            snf.removeAddress();
+         } catch (ActiveMQAddressDoesNotExistException e) {
+            logger.debug("Address already removed while reaping SnF queue {}", snf.getName());
+         }
+         snfReapStates.remove(nodeID);
+      } else {
+         // Non-empty with a known scale-down target: relocate the residual to the target's SnF queue.
+         // A later tick deletes the queue once it is empty.
+         logger.debug("Relocating {} residual SnF references from {} to scale-down target {}",
+                      snf.getMessageCount(), snf.getName(), target);
+         snf.moveReferencesBetweenSnFQueues(SimpleString.of(target));
+      }
    }
 
    private static boolean isBridgeLocatorClosed(Bridge bridge) {
@@ -1102,6 +1267,9 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
                                 final Queue queue,
                                 final boolean start) throws Exception {
       String nodeId;
+
+      // A record for this node is being (re)created: cancel any pending lazy reap of its SnF queue.
+      snfReapStates.remove(targetNodeID);
 
       synchronized (this) {
          if (!started) {

@@ -25,7 +25,6 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 
 import org.apache.activemq.artemis.api.config.ActiveMQDefaultConfiguration;
-import org.apache.activemq.artemis.api.core.ActiveMQAddressDoesNotExistException;
 import org.apache.activemq.artemis.api.core.ActiveMQException;
 import org.apache.activemq.artemis.api.core.ActiveMQExceptionType;
 import org.apache.activemq.artemis.api.core.Message;
@@ -53,7 +52,6 @@ import org.apache.activemq.artemis.core.server.ActiveMQServerLogger;
 import org.apache.activemq.artemis.core.server.ComponentConfigurationRoutingType;
 import org.apache.activemq.artemis.core.server.Queue;
 import org.apache.activemq.artemis.core.server.cluster.ActiveMQServerSideProtocolManagerFactory;
-import org.apache.activemq.artemis.core.server.impl.QueueImpl;
 import org.apache.activemq.artemis.core.server.cluster.ClusterConnection;
 import org.apache.activemq.artemis.core.server.cluster.ClusterManager;
 import org.apache.activemq.artemis.core.server.cluster.MessageFlowRecord;
@@ -440,6 +438,17 @@ public class ClusterConnectionBridge extends BridgeImpl {
    }
 
    @Override
+   protected void onScaleDown(final String scaleDownTargetNodeID) {
+      // Remember where the departing node scaled down to, so the lazy SnF reaper can relocate any
+      // residual references left in this node's SnF queue toward targetNodeID (see the lazy SnF
+      // reaper in ClusterConnectionImpl). In-memory only: a graceful local shutdown forwards any
+      // retained SnF contents via ScaleDownHandler.scaleDownSNF, so no durable record is needed.
+      if (targetNodeID != null && scaleDownTargetNodeID != null && clusterConnection instanceof ClusterConnectionImpl cc) {
+         cc.registerScaleDownTarget(targetNodeID, scaleDownTargetNodeID);
+      }
+   }
+
+   @Override
    protected void fail(final boolean permanently, final boolean scaleDown) {
       logger.debug("Cluster Bridge {} failed, permanently={}", this.getName(), permanently);
       final boolean ownsRecord = clusterConnection.isCurrentBridge(targetNodeID, this);
@@ -452,36 +461,13 @@ public class ClusterConnectionBridge extends BridgeImpl {
 
       if (permanently) {
          logger.debug("cluster node for bridge {} is permanently down", this.getName());
-         final boolean removedOurs = clusterConnection.removeRecord(targetNodeID, this, scaleDown);
-
-         if (scaleDown && removedOurs) {
-            final Queue snfQueue = queue;
-            final String nodeId = targetNodeID;
-            final ClusterConnectionImpl cc = (ClusterConnectionImpl) clusterConnection;
-            executor.execute(() -> {
-               // Re-check under recordsGuard so a concurrent nodeUP cannot lose its SnF queue
-               synchronized (cc.recordsGuard) {
-                  if (cc.getRecords().containsKey(nodeId)) {
-                     logger.debug("Skipping SnF delete for {}; a live flow record exists again", nodeId);
-                     return;
-                  }
-               }
-               if (snfQueue instanceof QueueImpl qi && !qi.isEmptyForScaleDown()) {
-                  ActiveMQServerLogger.LOGGER.scaleDownSkipNonEmptySnfDelete(
-                     snfQueue.getName().toString(), snfQueue.getMessageCount());
-                  return;
-               }
-               logger.debug("Scaling down queue {}", snfQueue);
-               try {
-                  snfQueue.deleteQueue(true);
-                  snfQueue.removeAddress();
-               } catch (ActiveMQAddressDoesNotExistException e) {
-                  logger.debug("ActiveMQAddressDoesNotExistException during scale down for queue {}", snfQueue);
-               } catch (Exception e) {
-                  logger.warn(e.getMessage(), e);
-               }
-            });
-         }
+         // Retain the SnF queue on scale-down teardown: do NOT delete it here. Deleting on this
+         // async path races the deferred addTail of an in-flight produce route (which is added only
+         // after its journal IO completes), losing or KILLing those references. The lazy SnF reaper
+         // in ClusterConnectionImpl removes the queue later, once it is provably idle, relocating any
+         // residual to the scale-down target first. removeRecord(scaleDown=true) already returns
+         // without deleting the queue.
+         clusterConnection.removeRecord(targetNodeID, this, scaleDown);
       } else {
          clusterConnection.disconnectRecord(targetNodeID);
       }
