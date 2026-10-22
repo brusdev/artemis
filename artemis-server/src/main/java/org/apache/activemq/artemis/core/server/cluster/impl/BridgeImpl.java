@@ -288,7 +288,7 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       return toString();
    }
 
-   private void cancelRefs() {
+   private List<MessageReference> cancelRefs() {
       LinkedList<MessageReference> list;
 
       synchronized (refs) {
@@ -300,9 +300,9 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          logger.trace("BridgeImpl::cancelRefs cancelling {} references", list.size());
       }
 
-      if (logger.isTraceEnabled() && list.isEmpty()) {
+      if (list.isEmpty()) {
          logger.trace("didn't have any references to cancel on bridge {}", this);
-         return;
+         return list;
       }
 
       ListIterator<MessageReference> listIterator = list.listIterator(list.size());
@@ -325,6 +325,8 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
             ActiveMQServerLogger.LOGGER.errorCancellingRefOnBridge(ref, e);
          }
       }
+
+      return list;
    }
 
    @Override
@@ -748,6 +750,13 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       } else if (scaleDownTargetNodeID != null) {
          // the disconnected node is scaling down to me, no need to reconnect to it
          logger.debug("Received scaleDownTargetNodeID: {}; cancelling reconnect.", scaleDownTargetNodeID);
+         // Fence SnF ingress BEFORE tearing the record down. Unlike scaleDown() above, this branch
+         // goes straight to fail(true, true) -> removeRecord -> async SnF deleteQueue without a drain
+         // loop, so there is nothing to relocate a late arrival. Disabling the departing node's remote
+         // bindings stops the post office from routing any new message into the SnF queue, closing the
+         // window where a message could land (addTail) after the empty-check and be destroyed by the
+         // delete. Whatever is already queued stays non-empty and is retained for delivery on nodeUP.
+         beforeScaleDownRelocate();
          fail(true, true);
       } else {
          logger.debug("Received null scaleDownTargetNodeID");
@@ -762,6 +771,12 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
       try {
          beforeScaleDownRelocate();
 
+         final QueueImpl snf = (QueueImpl) queue;
+
+         // SCALEDOWN-TRACE: snapshot before returning in-flight refs so we can correlate a later
+         // lost message with the exact drain decision that dropped it.
+         final long countBeforeCancel = snf.getMessageCount();
+
          // Return any in-flight references (messages this bridge had started forwarding but
          // never got confirmation for before the connection dropped) to the SnF queue BEFORE
          // draining. These references are held in the bridge's own refs map and are counted by
@@ -772,12 +787,20 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          // on a queue targeting the departing node and ultimately lost. We hold statusLock for the
          // whole method and handle() needs statusLock.tryLock(), so cancelled references cannot be
          // re-grabbed by this (now dead) bridge during the drain.
-         cancelRefs();
+         List<MessageReference> cancelled = cancelRefs();
+
+         if (logger.isDebugEnabled()) {
+            logger.debug("SCALEDOWN-TRACE begin queue={} target={} countBeforeCancel={} inFlightRefsCancelled={} countAfterCancel={} emptyAfterCancel={}",
+                         snf.getName(), scaleDownTargetNodeID, countBeforeCancel, cancelled.size(),
+                         snf.getMessageCount(), snf.isEmptyForScaleDown());
+            for (MessageReference ref : cancelled) {
+               logger.debug("SCALEDOWN-TRACE in-flight ref returned to queue={} msg={}", snf.getName(), ref.getMessage());
+            }
+         }
 
          if (logger.isDebugEnabled()) {
             logger.debug("Moving {} messages from {} to {}", queue.getMessageCount(), queue.getName(), scaleDownTargetNodeID);
          }
-         final QueueImpl snf = (QueueImpl) queue;
          final SimpleString targetSuffix = SimpleString.of(scaleDownTargetNodeID);
          int iteration = 0;
          while (iteration < MAX_SCALE_DOWN_DRAIN_ITERATIONS && !snf.isEmptyForScaleDown()) {
@@ -790,10 +813,18 @@ public class BridgeImpl implements Bridge, SessionFailureListener, SendAcknowled
          if (!snf.isEmptyForScaleDown()) {
             ActiveMQServerLogger.LOGGER.scaleDownDrainIncomplete(
                MAX_SCALE_DOWN_DRAIN_ITERATIONS, snf.getName().toString(), snf.getMessageCount());
+            // SCALEDOWN-TRACE: retain path — residual messages are kept for later delivery.
+            logger.debug("SCALEDOWN-TRACE decision=RETAIN (fail(true,false)) queue={} residualCount={} iterations={}",
+                         snf.getName(), snf.getMessageCount(), iteration);
             // Permanent fail without SnF delete so residual messages are retained
             fail(true, false);
             return;
          }
+
+         // SCALEDOWN-TRACE: delete path — the SnF queue (and anything getMessageCount() failed to
+         // account for) is about to be destroyed. If a lost message id shows up here we have the drop.
+         logger.debug("SCALEDOWN-TRACE decision=DELETE (fail(true,true)) queue={} finalCount={} iterations={} inFlightRefsCancelled={}",
+                      snf.getName(), snf.getMessageCount(), iteration, cancelled.size());
 
          // stop the bridge from trying to reconnect and clean up all the bindings
          fail(true, true);
