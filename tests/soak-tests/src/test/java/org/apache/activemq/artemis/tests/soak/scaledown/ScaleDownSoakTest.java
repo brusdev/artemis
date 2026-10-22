@@ -93,11 +93,19 @@ public class ScaleDownSoakTest extends SoakTestBase {
    private static final String MESSAGE_LOAD_BALANCING = testProperty(TEST_NAME, "MESSAGE_LOAD_BALANCING", "ON_DEMAND");
    private static final int TIMEOUT_MINUTES = testProperty(TEST_NAME, "TIMEOUT_MINUTES", 5);
    private static final int CONSUMER_TIMEOUT = testProperty(TEST_NAME, "CONSUMER_TIMEOUT", 1000);
-   private static final int UP_TIME = testProperty(TEST_NAME, "UP_TIME", 1000);
-   // Graceful shutdown now drains queues via scale-down over the SnF bridges, which can hit the
-   // 60s bridge-stop timeout, so the restart loop must allow well beyond that for a node to stop
-   // and for the cluster topology to converge again.
-   private static final int SHUTDOWN_TIMEOUT_SECONDS = testProperty(TEST_NAME, "SHUTDOWN_TIMEOUT_SECONDS", 120);
+   // Steady-state run between restarts. This must be long enough for the just-restarted node to
+   // rejoin the cluster and for consumers to actually drain the queue back down; otherwise (e.g. in
+   // the single-consumer scenario with redistributionDelay=0) the backlog on the restarted node only
+   // grows, every shutdown has more to scale down, and the node is restarted again mid-churn while
+   // its scale-down target is still saturated. A couple of seconds keeps each scale-down bounded.
+   private static final int UP_TIME = testProperty(TEST_NAME, "UP_TIME", 5000);
+   // Budget for a graceful stop to complete. Shutdown drains queues via scale-down over the SnF
+   // bridges (each of which can hit its ~60s stop timeout) and then transfers messages to a peer, so
+   // the budget must sit comfortably above the bridge-stop timeout. It is also a hard upper bound: if
+   // a drain stalls (the scale-down authorise/transfer can block while the connection stays alive),
+   // waitForServer() force-kills the node and the restart fails fast with a clear message rather than
+   // hanging. Keep this >= CLUSTER_TIMEOUT_MS so topology convergence is not the first thing to trip.
+   private static final int SHUTDOWN_TIMEOUT_SECONDS = testProperty(TEST_NAME, "SHUTDOWN_TIMEOUT_SECONDS", 180);
    private static final int CLUSTER_TIMEOUT_MS = testProperty(TEST_NAME, "CLUSTER_TIMEOUT_MS", 90_000);
    private static final int SERVER_START_TIMEOUT_MS = testProperty(TEST_NAME, "SERVER_START_TIMEOUT_MS", 30_000);
    // When enabled, the brokers log DEBUG for the cluster/scale-down classes so a focused
@@ -147,7 +155,7 @@ public class ScaleDownSoakTest extends SoakTestBase {
          try {
             assertTrue(process.waitFor(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS),
                "Server " + serverName + " did not stop within " + SHUTDOWN_TIMEOUT_SECONDS + "s");
-            assertEquals(0, process.exitValue());
+            assertEquals(0, process.exitValue(), "Server " + serverName + " exited with non-zero code");
          } catch (Throwable e) {
             logger.warn("Error stopping server {}, message={}", serverName, e.getMessage(), e);
          }
@@ -444,6 +452,7 @@ public class ScaleDownSoakTest extends SoakTestBase {
                   if (localSent % 100 == 0) {
                      logger.info("Producer {} server={} localSent={} totalSent={}", producerId, serverRecord.serverId, localSent, sent);
                   }
+                  Thread.sleep(10);
                }
             } catch (Exception e) {
                logger.info("Producer {} server={} reconnecting after: {}", producerId, serverRecord.serverId, e.getMessage());
@@ -521,28 +530,16 @@ public class ScaleDownSoakTest extends SoakTestBase {
 
    private void waitForMessages() {
       Wait.assertTrue(() -> {
-         logger.info("Test waiting for messages: totalSent={}, totalReceived={}, duplicates={}",
-            totalSent.get(), totalReceived.get(), countDuplicates());
-         return totalReceived.get() >= totalSent.get();
+         long countDuplicates = countDuplicates();
+         long countLostMessages = countLostMessages();
+         long countQueueMessages = countQueueMessages();
+         long countSnFMessages = countSnFMessages();
+
+         logger.info("Test waiting for messages: totalSent={}, totalReceived={}, duplicates={}, lostMessages={}, queueMessages={}, snfMessages={}",
+            totalSent.get(), totalReceived.get(), countDuplicates, countLostMessages, countQueueMessages, countSnFMessages);
+
+         return totalReceived.get() >= totalSent.get() && countLostMessages == 0 && countQueueMessages == 0 && countSnFMessages == 0;
       }, 30_000, 1_000);
-
-      Wait.assertTrue(() -> {
-         long count = countLostMessages();
-         logger.info("Test totalLostMessages={}", count);
-         return count == 0;
-      }, 30_000, 1_000);
-
-      Wait.assertTrue(() -> {
-         long count = countQueueMessages();
-         logger.info("Test totalQueueMessages={}", count);
-         return count == 0;
-      }, 5_000, 1_000);
-
-      Wait.assertTrue(() -> {
-         long count = countSnFMessages();
-         logger.info("Test totalSnFMessages={}", count);
-         return count == 0;
-      }, 5_000, 1_000);
    }
 
    private void stopConsumers() throws Exception {
