@@ -270,7 +270,8 @@ public final class BindingsImpl implements Bindings {
          nextPosition = moveNextPosition(nextPosition, bindingsCount);
          final Filter filter = binding.getFilter();
          final boolean highPrior = binding.isHighAcceptPriority(message);
-         if (highPrior && binding.getBindable() != originatingQueue && (filter == null || filter.match(message))) {
+         final boolean disabledRemote = binding instanceof RemoteQueueBinding remote && !remote.isEnabled();
+         if (!disabledRemote && highPrior && binding.getBindable() != originatingQueue && (filter == null || filter.match(message))) {
             nextBinding = binding;
             break;
          }
