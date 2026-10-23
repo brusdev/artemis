@@ -427,15 +427,20 @@ public class ClusterConnectionBridge extends BridgeImpl {
    }
 
    @Override
-   protected void fail(final boolean permanently, final boolean scaleDown) {
+   protected void fail(final boolean permanently, final String scaleDownTargetNodeID) {
       logger.debug("Cluster Bridge {} failed, permanently={}", this.getName(), permanently);
-      super.fail(permanently, scaleDown);
+
+      if (permanently) {
+         clusterConnection.disableRecord(targetNodeID);
+      }
+
+      super.fail(permanently, scaleDownTargetNodeID);
 
       if (permanently) {
          logger.debug("cluster node for bridge {} is permanently down", this.getName());
          clusterConnection.removeRecord(targetNodeID);
 
-         if (scaleDown) {
+         if (scaleDownTargetNodeID != null) {
             executor.execute(() -> {
                logger.debug("Scaling down queue {}", queue);
                try {

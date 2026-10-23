@@ -17,6 +17,8 @@
 package org.apache.activemq.artemis.tests.unit.core.postoffice.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 import javax.transaction.xa.Xid;
 import java.util.Collections;
@@ -84,6 +86,81 @@ public class BindingsImplTest extends ActiveMQTestBase {
       bind.addBinding(fake);
       bind.route(new CoreMessage(0, 100), new RoutingContextImpl(new FakeTransaction()));
       assertEquals(0, fake.routedCount.get());
+   }
+
+   /**
+    * Pins the critical invariant that {@link Binding#isEnabled()} defaults to {@code true}: a binding that does not
+    * override it (like a local queue binding or a divert) must still be routed to. If the default ever regresses to
+    * {@code false}, ordinary local delivery breaks and this test fails immediately.
+    */
+   @Test
+   public void testDefaultBindingIsEnabledAndRoutes() throws Exception {
+      final FakeBinding fake = new FakeBinding(SimpleString.of("a"));
+      fake.filter = null;  // such that it will match all messages
+      final Bindings bind = new BindingsImpl(null, null, new NullStorageManager(1000));
+      bind.addBinding(fake);
+      bind.route(new CoreMessage(0, 100), new RoutingContextImpl(new FakeTransaction()));
+      assertEquals(1, fake.routedCount.get());
+   }
+
+   @Test
+   public void testDisabledRemoteBindingIsNotRouted() throws Exception {
+      final FakeRemoteBinding fake = new FakeRemoteBinding(SimpleString.of("a"));
+      fake.filter = null;  // such that it will match all messages
+      fake.messageLoadBalancingType = MessageLoadBalancingType.ON_DEMAND;
+      fake.setEnabled(false);
+      final Bindings bind = new BindingsImpl(null, null, new NullStorageManager(1000));
+      bind.addBinding(fake);
+      bind.route(new CoreMessage(0, 100), new RoutingContextImpl(new FakeTransaction()));
+      assertEquals(0, fake.routedCount.get());
+   }
+
+   @Test
+   public void testDisabledRemoteBindingIsNotRoutedWithStrictOrdering() throws Exception {
+      final FakeRemoteBinding fake = new FakeRemoteBinding(SimpleString.of("a"));
+      fake.filter = null;  // such that it will match all messages
+      fake.messageLoadBalancingType = MessageLoadBalancingType.STRICT;
+      fake.setEnabled(false);
+      final Bindings bind = new BindingsImpl(null, null, new NullStorageManager(1000));
+      bind.addBinding(fake);
+      bind.route(new CoreMessage(0, 100), new RoutingContextImpl(new FakeTransaction()));
+      assertEquals(0, fake.routedCount.get());
+   }
+
+   @Test
+   public void testReEnabledRemoteBindingIsRouted() throws Exception {
+      final FakeRemoteBinding fake = new FakeRemoteBinding(SimpleString.of("a"));
+      fake.filter = null;  // such that it will match all messages
+      fake.messageLoadBalancingType = MessageLoadBalancingType.ON_DEMAND;
+      fake.setEnabled(false);
+      final Bindings bind = new BindingsImpl(null, null, new NullStorageManager(1000));
+      bind.addBinding(fake);
+      bind.route(new CoreMessage(0, 100), new RoutingContextImpl(new FakeTransaction()));
+      assertEquals(0, fake.routedCount.get());
+
+      fake.setEnabled(true);
+      bind.route(new CoreMessage(1, 100), new RoutingContextImpl(new FakeTransaction()));
+      assertEquals(1, fake.routedCount.get());
+   }
+
+   @Test
+   public void testDisabledBindingIsSkippedDuringRedistribution() throws Exception {
+      final FakeRemoteBinding fake = new FakeRemoteBinding(SimpleString.of("a"));
+      fake.filter = null;  // such that it will match all messages
+      fake.highAcceptPriority = true;
+      fake.messageLoadBalancingType = MessageLoadBalancingType.ON_DEMAND;
+      fake.setEnabled(false);
+      final Bindings bind = new BindingsImpl(null, null, new NullStorageManager(1000));
+      bind.addBinding(fake);
+
+      final Queue originatingQueue = new FakeQueue(SimpleString.of("a"));
+
+      assertNull(bind.redistribute(new CoreMessage(0, 100), originatingQueue, new RoutingContextImpl(new FakeTransaction())));
+      assertEquals(0, fake.routedCount.get());
+
+      fake.setEnabled(true);
+      assertNotNull(bind.redistribute(new CoreMessage(1, 100), originatingQueue, new RoutingContextImpl(new FakeTransaction())));
+      assertEquals(1, fake.routedCount.get());
    }
 
    @Test
@@ -336,6 +413,7 @@ public class BindingsImplTest extends ActiveMQTestBase {
 
       Filter filter = new FakeFilter();
       AtomicInteger routedCount = new AtomicInteger();
+      boolean highAcceptPriority = false;
       @Override
       public void close() throws Exception {
 
@@ -407,7 +485,7 @@ public class BindingsImplTest extends ActiveMQTestBase {
 
       @Override
       public boolean isHighAcceptPriority(final Message message) {
-         return false;
+         return highAcceptPriority;
       }
 
       @Override
@@ -432,8 +510,19 @@ public class BindingsImplTest extends ActiveMQTestBase {
 
    private final class FakeRemoteBinding extends FakeBinding implements RemoteQueueBinding {
       MessageLoadBalancingType messageLoadBalancingType;
+      boolean enabled = true;
       FakeRemoteBinding(SimpleString name) {
          super(name);
+      }
+
+      @Override
+      public boolean isEnabled() {
+         return enabled;
+      }
+
+      @Override
+      public void setEnabled(boolean enabled) {
+         this.enabled = enabled;
       }
 
       @Override
