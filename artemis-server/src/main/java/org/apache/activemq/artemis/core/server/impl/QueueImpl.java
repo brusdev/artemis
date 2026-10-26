@@ -3553,6 +3553,8 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
 
       RoutingContext routingContext = new RoutingContextImpl(tx);
 
+      boolean missingTarget = false;
+
       /*
        * this algorithm will look at the old route and find the new remote queue bindings where the messages should go
        * and route them there directly
@@ -3567,13 +3569,43 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
 
          if (targetBinding == null) {
             ActiveMQServerLogger.LOGGER.unableToFindTargetQueue(targetNodeID);
+            // a single missing target abandons the directed route: the message is re-routed as a whole
+            // (anycast) or left on the source SnF (multicast), so there is no point remapping the rest
+            missingTarget = true;
+            break;
          } else {
             logger.debug("Routing on binding: {}", targetBinding);
             targetBinding.route(copyMessage, routingContext);
          }
       }
 
-      postOffice.processRoute(copyMessage, routingContext, false);
+      if (missingTarget) {
+         // One or more remote queue IDs could not be remapped to the scale-down target. The routing
+         // type comes from the original message (makeCopy clears it on the copy), falling back to the
+         // address when it is not set; a null routing type must not be assumed to be anycast (e.g. an
+         // AMQP message sent to a multicast address).
+         RoutingType routingType = ref.getMessage().getRoutingType();
+         if (routingType == null) {
+            AddressInfo addressInfo = postOffice.getAddressInfo(copyMessage.getAddressSimpleString());
+            routingType = addressInfo != null && addressInfo.getRoutingTypes().contains(RoutingType.MULTICAST) ? RoutingType.MULTICAST : RoutingType.ANYCAST;
+         }
+
+         if (routingType != RoutingType.ANYCAST) {
+            // A multicast SnF message is only the slice already chosen for the departing node's
+            // subscriptions, so re-routing it on the whole address would duplicate deliveries. Leave
+            // the reference on the source SnF rather than acknowledging a message that was not moved.
+            return false;
+         }
+
+         // Re-route the anycast message as if it were newly received, honouring the address-settings
+         // for unroutable messages (drop or dead-letter), then acknowledge the source reference.
+         // Duplicate detection is disabled: the original was already routed through this node when it
+         // was produced, so its duplicate id may still be cached and would reject this relocation.
+         copyMessage.setRoutingType(RoutingType.ANYCAST);
+         postOffice.route(copyMessage, tx, false, false);
+      } else {
+         postOffice.processRoute(copyMessage, routingContext, false);
+      }
 
       ref.handled();
 
@@ -3603,8 +3635,10 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
       for (RemoteQueueBinding remoteQueueBinding : iterableOf(postOffice.getAllBindings()
                                                                  .filter(RemoteQueueBinding.class::isInstance)
                                                                  .map(RemoteQueueBinding.class::cast))) {
-         // does this remote queue binding point to the same queue as the message?
-         if (oldQueueID == remoteQueueBinding.getRemoteQueueID()) {
+         // does this remote queue binding belong to the SnF queue being drained and point to the same
+         // queue as the message? remoteQueueID is node-local, so without the queue check a colliding ID
+         // from another node's binding could resolve the wrong routing name.
+         if (remoteQueueBinding.getQueue() == this && oldQueueID == remoteQueueBinding.getRemoteQueueID()) {
             // get the name of this queue so we can find the corresponding remote queue binding pointing to the scale down target node
             SimpleString oldQueueName = remoteQueueBinding.getRoutingName();
 
