@@ -20,6 +20,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -33,6 +34,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.activemq.artemis.api.core.ActiveMQAddressDoesNotExistException;
 import org.apache.activemq.artemis.api.core.ActiveMQException;
 import org.apache.activemq.artemis.api.core.DiscoveryGroupConfiguration;
 import org.apache.activemq.artemis.api.core.Pair;
@@ -70,6 +72,7 @@ import org.apache.activemq.artemis.core.server.cluster.Bridge;
 import org.apache.activemq.artemis.core.server.cluster.ClusterConnection;
 import org.apache.activemq.artemis.core.server.cluster.ClusterControl;
 import org.apache.activemq.artemis.core.server.cluster.ClusterManager;
+import org.apache.activemq.artemis.core.server.impl.QueueImpl;
 import org.apache.activemq.artemis.core.server.cluster.ClusterManager.IncomingInterceptorLookingForExceptionMessage;
 import org.apache.activemq.artemis.core.server.cluster.MessageFlowRecord;
 import org.apache.activemq.artemis.core.server.cluster.RemoteQueueBinding;
@@ -197,6 +200,18 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
    private final TopologyScanner topologyScanner;
 
+   // Period (ms) between scale-down reaper runs; <= 0 disables the reaper (SnF queues are retained, never reclaimed).
+   private final long scaleDownReaperPeriod;
+
+   // Consecutive reaper ticks an orphaned SnF queue must stay idle before it is reclaimed.
+   private final int scaleDownReaperGraceTicks;
+
+   // Maximum number of reaping attempts for a candidate node before abandoning.
+   private final int scaleDownReaperMaxAttempts;
+
+   private final Map<String, SnFReapState> snfReapStates = new ConcurrentHashMap<>();
+   private SnFReaper snfReaper;
+
    /**
     * For tests only
     */
@@ -237,7 +252,10 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
                                 final long clusterNotificationInterval,
                                 final int clusterNotificationAttempts,
                                 final String clientId,
-                                final int topologyScannerAttempts) throws Exception {
+                                final int topologyScannerAttempts,
+                                final long scaleDownReaperPeriod,
+                                final int scaleDownReaperGraceTicks,
+                                final int scaleDownReaperMaxAttempts) throws Exception {
       this.nodeManager = nodeManager;
 
       this.connector = connector;
@@ -327,6 +345,12 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
       this.topologyScanner = topologyScannerAttempts == 0 ? null : new TopologyScanner(
           scheduledExecutor, executor, topologyScannerAttempts);
+
+      this.scaleDownReaperPeriod = scaleDownReaperPeriod;
+
+      this.scaleDownReaperGraceTicks = scaleDownReaperGraceTicks;
+
+      this.scaleDownReaperMaxAttempts = scaleDownReaperMaxAttempts;
    }
 
    public ClusterConnectionImpl(final ClusterManager manager,
@@ -361,7 +385,10 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
                                 final long clusterNotificationInterval,
                                 final int clusterNotificationAttempts,
                                 final String clientId,
-                                final int topologyScannerAttempts) throws Exception {
+                                final int topologyScannerAttempts,
+                                final long scaleDownReaperPeriod,
+                                final int scaleDownReaperGraceTicks,
+                                final int scaleDownReaperMaxAttempts) throws Exception {
       this.nodeManager = nodeManager;
 
       this.connector = connector;
@@ -436,6 +463,12 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
       this.topologyScanner = topologyScannerAttempts == 0 ? null : new TopologyScanner(
           scheduledExecutor, executor, topologyScannerAttempts);
+
+      this.scaleDownReaperPeriod = scaleDownReaperPeriod;
+
+      this.scaleDownReaperGraceTicks = scaleDownReaperGraceTicks;
+
+      this.scaleDownReaperMaxAttempts = scaleDownReaperMaxAttempts;
    }
 
    @Override
@@ -477,6 +510,10 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
       if (topologyScanner != null) {
          topologyScanner.stop();
+      }
+
+      if (snfReaper != null) {
+         snfReaper.stop();
       }
 
       if (logger.isDebugEnabled()) {
@@ -914,6 +951,15 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       }
       //we add as a listener after we have sent the cluster start notif as the listener may start sending notifs before
       addClusterTopologyListener(this);
+
+      if (scaleDownReaperPeriod > 0) {
+         logger.debug("{}::scheduling scale-down reaper, period={}ms, graceTicks={}, maxAttempts={}", this, scaleDownReaperPeriod, scaleDownReaperGraceTicks, scaleDownReaperMaxAttempts);
+
+         snfReaper = new SnFReaper(scheduledExecutor, executor, scaleDownReaperPeriod, scaleDownReaperPeriod, TimeUnit.MILLISECONDS);
+         snfReaper.start();
+      } else {
+         logger.debug("{}::scale-down reaper disabled (period={})", this, scaleDownReaperPeriod);
+      }
    }
 
    @Override
@@ -1110,6 +1156,8 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       }
 
       record.setBridge(bridge);
+
+      snfReapStates.remove(targetNodeID);
 
       records.put(targetNodeID, record);
 
@@ -1855,6 +1903,14 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       }
    }
 
+   @Override
+   public void registerScaleDownTarget(String targetNodeID, String scaleDownTargetNodeID) {
+      synchronized (recordsGuard) {
+         logger.debug("Registering scale-down target {} for departed node {}", scaleDownTargetNodeID, targetNodeID);
+         snfReapStates.computeIfAbsent(targetNodeID, k -> new SnFReapState()).scaleDownTarget = scaleDownTargetNodeID;
+      }
+   }
+
    private final class PrimaryNotifier implements Runnable {
 
       int notificationsSent = 0;
@@ -1881,6 +1937,96 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       public void resendPrimary() {
          if (!stopping && started) {
             topology.resendNode(manager.getNodeId());
+         }
+      }
+   }
+
+   private static final class SnFReapState {
+      int attempts;
+      int idleTicks;
+      String scaleDownTarget;
+   }
+
+   /**
+    * Periodic task that reaps retained, scale-down SnF queues.
+    */
+   private final class SnFReaper extends ActiveMQScheduledComponent {
+
+      SnFReaper(ScheduledExecutorService scheduledExecutorService, Executor executor, long initialDelay, long period, TimeUnit timeUnit) {
+         super(scheduledExecutorService, executor, initialDelay, period, timeUnit, false);
+      }
+
+      @Override
+      public void run() {
+         final List<String> candidates = new ArrayList<>(snfReapStates.keySet());
+
+         for (String candidateNodeId : candidates) {
+            if (stopping || !started) {
+               return;
+            }
+            try {
+               reapCandidate(candidateNodeId);
+            } catch (Throwable t) {
+               logger.debug("SnF reaper failed reaping {}", candidateNodeId, t);
+            }
+         }
+      }
+   }
+
+   private void reapCandidate(String candidateNodeId) throws Exception {
+      synchronized (recordsGuard) {
+         SnFReapState snfReapState = snfReapStates.get(candidateNodeId);
+         if (snfReapState == null) {
+            return;
+         }
+
+         snfReapState.attempts++;
+
+         // Abandon and retain queue if max attempts exceeded
+         if (scaleDownReaperMaxAttempts > 0 && snfReapState.attempts > scaleDownReaperMaxAttempts) {
+            logger.warn("Exceeded max scale-down reaper attempts ({}) for SnF queue toward departed node {}. The queue will be retained.", scaleDownReaperMaxAttempts, candidateNodeId);
+            snfReapStates.remove(candidateNodeId);
+            return;
+         }
+
+         // Cancel reaping if the node reconnected and re-created its record
+         MessageFlowRecord record = records.get(candidateNodeId);
+         if (record != null) {
+            snfReapStates.remove(candidateNodeId);
+            return;
+         }
+
+         // Locate the SnF queue; stop tracking if already deleted
+         final SimpleString queueName = getSfQueueName(candidateNodeId);
+         Binding queueBinding = postOffice.getBinding(queueName);
+         QueueImpl snfQueue = queueBinding == null ? null : (QueueImpl) queueBinding.getBindable();
+         if (snfQueue == null) {
+            snfReapStates.remove(candidateNodeId);
+            return;
+         }
+
+         // Relocate residual messages to scale-down target and reset idle tick counter
+         if (snfQueue.getMessageCount() > 0) {
+            snfReapState.idleTicks = 0;
+            logger.debug("Relocating {} residual SnF references from {} to scale-down target {}",
+               snfQueue.getMessageCount(), snfQueue.getName(), snfReapState.scaleDownTarget);
+            snfQueue.moveReferencesBetweenSnFQueues(snfReapState.scaleDownTarget);
+            return;
+         }
+
+         snfReapState.idleTicks++;
+
+         // Reclaim queue once it has stayed idle for the required consecutive idle ticks
+         if (snfReapState.idleTicks > scaleDownReaperGraceTicks) {
+            try {
+               logger.debug("Reaping idle SnF queue {} for departed node {}", snfQueue.getName(), candidateNodeId);
+               snfQueue.deleteQueue(true);
+               snfQueue.removeAddress();
+            } catch (ActiveMQAddressDoesNotExistException e) {
+               logger.debug("Address already removed while reaping SnF queue {}", snfQueue.getName());
+            }
+
+            snfReapStates.remove(candidateNodeId);
          }
       }
    }
