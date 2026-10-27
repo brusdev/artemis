@@ -20,6 +20,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -31,8 +32,10 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.activemq.artemis.api.core.ActiveMQAddressDoesNotExistException;
 import org.apache.activemq.artemis.api.core.ActiveMQException;
 import org.apache.activemq.artemis.api.core.DiscoveryGroupConfiguration;
 import org.apache.activemq.artemis.api.core.Pair;
@@ -70,6 +73,7 @@ import org.apache.activemq.artemis.core.server.cluster.Bridge;
 import org.apache.activemq.artemis.core.server.cluster.ClusterConnection;
 import org.apache.activemq.artemis.core.server.cluster.ClusterControl;
 import org.apache.activemq.artemis.core.server.cluster.ClusterManager;
+import org.apache.activemq.artemis.core.server.impl.QueueImpl;
 import org.apache.activemq.artemis.core.server.cluster.ClusterManager.IncomingInterceptorLookingForExceptionMessage;
 import org.apache.activemq.artemis.core.server.cluster.MessageFlowRecord;
 import org.apache.activemq.artemis.core.server.cluster.RemoteQueueBinding;
@@ -197,6 +201,24 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
    private final TopologyScanner topologyScanner;
 
+   // Period (ms) between scale-down reaper runs; <= 0 disables the reaper (SnF queues are retained, never reclaimed).
+   private final long scaleDownReaperPeriod;
+
+   // Consecutive reaper ticks an orphaned SnF queue must stay idle before it is reclaimed.
+   private final int scaleDownReaperGraceTicks;
+
+   // Departed nodeID -> scale-down target nodeID, populated at teardown; used by the reaper to relocate residuals.
+   private final Map<String, String> scaleDownTargets = new ConcurrentHashMap<>();
+
+   // nodeID -> consecutive ticks the orphaned SnF queue for that node has been eligible for reaping.
+   private final Map<String, Integer> reaperTicks = new ConcurrentHashMap<>();
+
+   // nodeIDs whose SnF queue the reaper has claimed and is deleting. Guarded by recordsGuard: a claim and the
+   // createFlowRecord reuse check are thus mutually exclusive, so a returning node never reuses a queue being reaped.
+   private final Set<String> reapingNodes = new HashSet<>();
+
+   private ScheduledFuture<?> reaperFuture;
+
    /**
     * For tests only
     */
@@ -237,7 +259,9 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
                                 final long clusterNotificationInterval,
                                 final int clusterNotificationAttempts,
                                 final String clientId,
-                                final int topologyScannerAttempts) throws Exception {
+                                final int topologyScannerAttempts,
+                                final long scaleDownReaperPeriod,
+                                final int scaleDownReaperGraceTicks) throws Exception {
       this.nodeManager = nodeManager;
 
       this.connector = connector;
@@ -327,6 +351,10 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
       this.topologyScanner = topologyScannerAttempts == 0 ? null : new TopologyScanner(
           scheduledExecutor, executor, topologyScannerAttempts);
+
+      this.scaleDownReaperPeriod = scaleDownReaperPeriod;
+
+      this.scaleDownReaperGraceTicks = scaleDownReaperGraceTicks;
    }
 
    public ClusterConnectionImpl(final ClusterManager manager,
@@ -361,7 +389,9 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
                                 final long clusterNotificationInterval,
                                 final int clusterNotificationAttempts,
                                 final String clientId,
-                                final int topologyScannerAttempts) throws Exception {
+                                final int topologyScannerAttempts,
+                                final long scaleDownReaperPeriod,
+                                final int scaleDownReaperGraceTicks) throws Exception {
       this.nodeManager = nodeManager;
 
       this.connector = connector;
@@ -436,6 +466,10 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
       this.topologyScanner = topologyScannerAttempts == 0 ? null : new TopologyScanner(
           scheduledExecutor, executor, topologyScannerAttempts);
+
+      this.scaleDownReaperPeriod = scaleDownReaperPeriod;
+
+      this.scaleDownReaperGraceTicks = scaleDownReaperGraceTicks;
    }
 
    @Override
@@ -478,6 +512,8 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       if (topologyScanner != null) {
          topologyScanner.stop();
       }
+
+      stopReaper();
 
       if (logger.isDebugEnabled()) {
          logger.debug("Cluster connection being stopped for node{}, server = {} serverLocator = {}", nodeManager.getNodeId(), server, serverLocator);
@@ -914,6 +950,31 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
       }
       //we add as a listener after we have sent the cluster start notif as the listener may start sending notifs before
       addClusterTopologyListener(this);
+
+      startReaper();
+   }
+
+   private void startReaper() {
+      if (scaleDownReaperPeriod <= 0) {
+         logger.debug("{}::scale-down reaper disabled (period={})", this, scaleDownReaperPeriod);
+         return;
+      }
+      if (reaperFuture != null) {
+         return;
+      }
+      logger.debug("{}::scheduling scale-down reaper, period={}ms, graceTicks={}", this, scaleDownReaperPeriod, scaleDownReaperGraceTicks);
+      reaperFuture = scheduledExecutor.scheduleWithFixedDelay(this::reapStoreAndForwardQueues, scaleDownReaperPeriod, scaleDownReaperPeriod, TimeUnit.MILLISECONDS);
+   }
+
+   private void stopReaper() {
+      if (reaperFuture != null) {
+         reaperFuture.cancel(false);
+         reaperFuture = null;
+      }
+      reaperTicks.clear();
+      synchronized (recordsGuard) {
+         reapingNodes.clear();
+      }
    }
 
    @Override
@@ -985,6 +1046,13 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
                Binding queueBinding = postOffice.getBinding(queueName);
 
                Queue queue;
+
+               if (reapingNodes.contains(nodeID)) {
+                  // The reaper has claimed this node's SnF queue for deletion; do not reuse a queue that is being torn
+                  // down. The reaper re-creates the record after it finishes (recreateRecordIfBack).
+                  logger.debug("{}::SnF queue {} is being reaped; deferring record creation for nodeID={}", this, queueName, nodeID);
+                  return;
+               }
 
                if (queueBinding != null) {
                   queue = (Queue) queueBinding.getBindable();
@@ -1062,6 +1130,9 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
 
          nodeId = serverLocator.getNodeID();
       }
+
+      // The node owns its SnF queue again: drop any pending reaper relocation target for it.
+      scaleDownTargets.remove(targetNodeID);
 
       final ServerLocatorInternal targetLocator = new ServerLocatorImpl(topology, true, connector);
 
@@ -1808,25 +1879,180 @@ public final class ClusterConnectionImpl implements ClusterConnection, AfterConn
             oldBridge.flushExecutor();
          }
 
-         TopologyMemberImpl member = topology.getMember(targetNodeID);
-         if (member != null && member.getPrimary() != null && !stopping) {
-            logger.debug("Node {} is already back in the topology after record removal; re-creating bridge", targetNodeID);
-            try {
-               SimpleString queueName = getSfQueueName(targetNodeID);
-               Binding queueBinding = postOffice.getBinding(queueName);
-               Queue queue;
-               if (queueBinding != null) {
-                  queue = (Queue) queueBinding.getBindable();
-               } else {
-                  queue = server.createQueue(QueueConfiguration.of(queueName).setRoutingType(RoutingType.MULTICAST).setAutoCreateAddress(true).setMaxConsumers(-1).setPurgeOnNoConsumers(false).setInternal(true));
+         recreateRecordIfBack(targetNodeID);
+      }
+   }
+
+   /**
+    * If the node is already (back) in the topology and has no flow record, re-create the record (reusing the retained
+    * SnF queue). Must be called while holding {@link #recordsGuard}. A queue already claimed by the reaper
+    * ({@link Queue#isReaping()}) is left alone: the reaper owns it and will re-create the record after it finishes
+    * deleting.
+    */
+   private void recreateRecordIfBack(String targetNodeID) {
+      if (stopping || records.containsKey(targetNodeID)) {
+         return;
+      }
+      TopologyMemberImpl member = topology.getMember(targetNodeID);
+      if (member == null || member.getPrimary() == null) {
+         return;
+      }
+      if (reapingNodes.contains(targetNodeID)) {
+         logger.debug("SnF queue toward {} is being reaped; deferring record re-creation to the reaper", targetNodeID);
+         return;
+      }
+      logger.debug("Node {} is back in the topology; re-creating bridge", targetNodeID);
+      try {
+         SimpleString queueName = getSfQueueName(targetNodeID);
+         Binding queueBinding = postOffice.getBinding(queueName);
+         Queue queue;
+         if (queueBinding != null) {
+            queue = (Queue) queueBinding.getBindable();
+         } else {
+            queue = server.createQueue(QueueConfiguration.of(queueName).setRoutingType(RoutingType.MULTICAST).setAutoCreateAddress(true).setMaxConsumers(-1).setPurgeOnNoConsumers(false).setInternal(true));
+         }
+         queue.setInternalQueue(true);
+         createNewRecord(member.getUniqueEventID(), targetNodeID, member.getPrimary(), queueName, queue, true);
+      } catch (Exception e) {
+         ActiveMQServerLogger.LOGGER.errorUpdatingTopology(e);
+      }
+   }
+
+   @Override
+   public void registerScaleDownTarget(String targetNodeID, String scaleDownTargetNodeID) {
+      if (scaleDownTargetNodeID == null) {
+         scaleDownTargets.remove(targetNodeID);
+      } else {
+         logger.debug("Registering scale-down target {} for departed node {}", scaleDownTargetNodeID, targetNodeID);
+         scaleDownTargets.put(targetNodeID, scaleDownTargetNodeID);
+      }
+   }
+
+   /**
+    * Periodic task that reclaims orphaned store-and-forward queues left behind by scaled-down or departed nodes.
+    * <p>
+    * Teardown no longer deletes the SnF queue eagerly (which raced the deferred {@code addTail} of an in-flight route),
+    * so this reaper deletes it only once it is provably idle: owner-less (no flow record, not a live topology member)
+    * and empty (or relocated to the scale-down target), stable across {@link #scaleDownReaperGraceTicks} consecutive
+    * ticks. The destructive work runs outside {@link #recordsGuard}; only the cheap claim is guarded, following the
+    * same lock discipline the record-replacement path uses.
+    */
+   private void reapStoreAndForwardQueues() {
+      if (stopping || !started) {
+         return;
+      }
+      try {
+         final String prefix = storeAndForwardPrefix + name + ".";
+         final SimpleString localNodeID = nodeManager.getNodeId();
+
+         // Discover candidate SnF queues (owner-less) and keep a stable-tick counter per node.
+         final Map<String, Queue> candidates = new HashMap<>();
+         postOffice.getAllBindings().forEach(binding -> {
+            if (binding.getBindable() instanceof Queue queue) {
+               final String bindingName = binding.getUniqueName().toString();
+               if (bindingName.startsWith(prefix)) {
+                  final String nodeID = bindingName.substring(prefix.length());
+                  if ((localNodeID == null || !localNodeID.toString().equals(nodeID)) && isOrphanedSnF(nodeID)) {
+                     candidates.put(nodeID, queue);
+                  }
                }
-               queue.setInternalQueue(true);
-               createNewRecord(member.getUniqueEventID(), targetNodeID, member.getPrimary(), queueName, queue, true);
-            } catch (Exception e) {
-               ActiveMQServerLogger.LOGGER.errorUpdatingTopology(e);
+            }
+         });
+
+         // Drop stale tick entries for nodes that are no longer candidates (reclaimed or owner returned).
+         reaperTicks.keySet().retainAll(candidates.keySet());
+
+         final List<String> claimable = new ArrayList<>();
+         for (String nodeID : candidates.keySet()) {
+            int ticks = reaperTicks.merge(nodeID, 1, Integer::sum);
+            if (ticks >= scaleDownReaperGraceTicks) {
+               claimable.add(nodeID);
             }
          }
+
+         if (claimable.isEmpty()) {
+            return;
+         }
+
+         // Phase 1 (under recordsGuard): atomically claim queues that are still owner-less. Holding the claim in
+         // reapingNodes under the same guard the createFlowRecord reuse check uses makes the decision lock-based: a
+         // returning node sees the claim and does not reuse a queue that is being deleted.
+         final Map<String, Queue> claimed = new HashMap<>();
+         synchronized (recordsGuard) {
+            for (String nodeID : claimable) {
+               if (records.containsKey(nodeID) || reapingNodes.contains(nodeID)) {
+                  continue;
+               }
+               Queue queue = candidates.get(nodeID);
+               if (queue != null) {
+                  reapingNodes.add(nodeID);
+                  claimed.put(nodeID, queue);
+               }
+            }
+         }
+
+         // Phase 2 (no lock): relocate residuals then delete empty queues. reapingNodes is left untouched here so the
+         // claim stays held (reuse stays blocked) for the whole destructive step; it is released under the guard below.
+         final List<String> reaped = new ArrayList<>();
+         final List<String> retained = new ArrayList<>();
+         for (Map.Entry<String, Queue> entry : claimed.entrySet()) {
+            final String nodeID = entry.getKey();
+            final Queue queue = entry.getValue();
+            try {
+               if (queue.getMessageCount() > 0) {
+                  final String target = scaleDownTargets.get(nodeID);
+                  if (target == null) {
+                     // No known relocation target (plain disconnect or lost cache): retain for reconnection / shutdown.
+                     logger.debug("Retaining non-empty owner-less SnF queue {} (no scale-down target)", queue.getName());
+                     retained.add(nodeID);
+                     continue;
+                  }
+                  logger.debug("Relocating {} messages from SnF queue {} to scale-down target {}", queue.getMessageCount(), queue.getName(), target);
+                  ((QueueImpl) queue).moveReferencesBetweenSnFQueues(SimpleString.of(target));
+                  if (queue.getMessageCount() > 0) {
+                     // Some references could not be relocated (e.g. multicast slices left in place): retain.
+                     logger.debug("Retaining SnF queue {} with {} messages left after relocation", queue.getName(), queue.getMessageCount());
+                     retained.add(nodeID);
+                     continue;
+                  }
+               }
+               logger.debug("Reaping empty owner-less SnF queue {}", queue.getName());
+               queue.deleteQueue(true);
+               queue.removeAddress();
+               reaped.add(nodeID);
+            } catch (ActiveMQAddressDoesNotExistException e) {
+               logger.debug("Address already gone while reaping SnF queue {}", queue.getName());
+               reaped.add(nodeID);
+            } catch (Exception e) {
+               ActiveMQServerLogger.LOGGER.failedToRemoveRecord(e);
+               retained.add(nodeID);
+            }
+         }
+
+         // Phase 3 (under recordsGuard): release claims; clear bookkeeping and re-create records for reaped nodes.
+         if (!reaped.isEmpty() || !retained.isEmpty()) {
+            synchronized (recordsGuard) {
+               for (String nodeID : reaped) {
+                  reapingNodes.remove(nodeID);
+                  reaperTicks.remove(nodeID);
+                  scaleDownTargets.remove(nodeID);
+                  recreateRecordIfBack(nodeID);
+               }
+               // Released claim for retained queues; they stay as candidates and may be re-evaluated on a later tick.
+               reapingNodes.removeAll(retained);
+            }
+         }
+      } catch (Throwable t) {
+         logger.warn("Error running the store-and-forward reaper on cluster connection {}", name, t);
       }
+   }
+
+   private boolean isOrphanedSnF(String nodeID) {
+      if (records.containsKey(nodeID)) {
+         return false;
+      }
+      TopologyMemberImpl member = topology.getMember(nodeID);
+      return member == null || member.getPrimary() == null;
    }
 
    @Override

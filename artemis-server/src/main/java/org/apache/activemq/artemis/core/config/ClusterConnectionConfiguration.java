@@ -88,6 +88,10 @@ public final class ClusterConnectionConfiguration implements Serializable {
 
    private int topologyScannerAttempts = ActiveMQDefaultConfiguration.getClusterTopologyScannerAttempts();
 
+   private long scaleDownReaperPeriod = ActiveMQDefaultConfiguration.getDefaultClusterScaleDownReaperPeriod();
+
+   private int scaleDownReaperGraceTicks = ActiveMQDefaultConfiguration.getDefaultClusterScaleDownReaperGraceTicks();
+
    public ClusterConnectionConfiguration() {
    }
 
@@ -330,6 +334,24 @@ public final class ClusterConnectionConfiguration implements Serializable {
       return this;
    }
 
+   public long getScaleDownReaperPeriod() {
+      return scaleDownReaperPeriod;
+   }
+
+   public ClusterConnectionConfiguration setScaleDownReaperPeriod(long scaleDownReaperPeriod) {
+      this.scaleDownReaperPeriod = scaleDownReaperPeriod;
+      return this;
+   }
+
+   public int getScaleDownReaperGraceTicks() {
+      return scaleDownReaperGraceTicks;
+   }
+
+   public ClusterConnectionConfiguration setScaleDownReaperGraceTicks(int scaleDownReaperGraceTicks) {
+      this.scaleDownReaperGraceTicks = scaleDownReaperGraceTicks;
+      return this;
+   }
+
    /**
     * This method will match the configuration and return the proper TransportConfiguration for the Configuration
     */
@@ -392,7 +414,8 @@ public final class ClusterConnectionConfiguration implements Serializable {
                           confirmationWindowSize, connectionTTL, connectorName, discoveryGroupName, duplicateDetection,
                           messageLoadBalancingType, maxHops, maxRetryInterval, minLargeMessageSize, name,
                           initialConnectAttempts, reconnectAttempts, retryInterval, retryIntervalMultiplier,
-                          staticConnectors, clientId, topologyScannerAttempts);
+                          staticConnectors, clientId, topologyScannerAttempts, scaleDownReaperPeriod,
+                          scaleDownReaperGraceTicks);
    }
 
    @Override
@@ -426,7 +449,9 @@ public final class ClusterConnectionConfiguration implements Serializable {
              Double.doubleToLongBits(retryIntervalMultiplier) == Double.doubleToLongBits(other.retryIntervalMultiplier) &&
              Objects.equals(staticConnectors, other.staticConnectors) &&
              Objects.equals(clientId, other.clientId) &&
-             topologyScannerAttempts == other.topologyScannerAttempts;
+             topologyScannerAttempts == other.topologyScannerAttempts &&
+             scaleDownReaperPeriod == other.scaleDownReaperPeriod &&
+             scaleDownReaperGraceTicks == other.scaleDownReaperGraceTicks;
    }
 
    @Override
@@ -457,6 +482,8 @@ public final class ClusterConnectionConfiguration implements Serializable {
          ", clusterNotificationAttempts=" + clusterNotificationAttempts +
          ", clientId=" + clientId +
          ", topologyScannerInterval=" + topologyScannerAttempts +
+         ", scaleDownReaperPeriod=" + scaleDownReaperPeriod +
+         ", scaleDownReaperGraceTicks=" + scaleDownReaperGraceTicks +
          '}';
    }
 }
