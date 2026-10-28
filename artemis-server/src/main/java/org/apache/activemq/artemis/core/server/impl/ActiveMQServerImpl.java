@@ -1682,6 +1682,31 @@ public class ActiveMQServerImpl implements ActiveMQServer {
             ActiveMQServerLogger.LOGGER.errorClosingSession(e);
          }
       }
+
+      // ServerSession.close() schedules consumer cancelRefs() asynchronously via the session's OperationContext.
+      // When scale-down follows immediately in postConnectionFreeze(), scaleDownMessages() must see those refs
+      // back in the queue — otherwise in-flight (dispatched) messages are skipped and lost.
+      // Wait for every session's I/O context to drain, sharing a single wall-clock deadline across all sessions.
+      final long closeSessionsTimeoutMillis = 30_000L;
+      final long start = System.currentTimeMillis();
+      final long deadline = start + closeSessionsTimeoutMillis;
+      logger.info("Waiting for {} session(s) to complete close before scale-down", sessions.size());
+      for (ServerSession serverSession : sessions.values()) {
+         final long remaining = (deadline - System.currentTimeMillis());
+         if (remaining <= 0) {
+            logger.warn("Timed out waiting for all sessions to complete their close during scale-down freeze");
+            break;
+         }
+         try {
+            if (!serverSession.getSessionContext().waitCompletion(remaining)) {
+               logger.warn("Timed out waiting for session {} to complete its close during scale-down freeze", serverSession);
+               break;
+            }
+         } catch (Exception e) {
+            ActiveMQServerLogger.LOGGER.errorClosingSession(e);
+         }
+      }
+      logger.info("All sessions completed close in {} ms", (System.currentTimeMillis() - start));
    }
 
    /**
