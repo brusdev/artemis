@@ -78,50 +78,94 @@ public class QueueImplTest {
    }
 
    /**
-    * When a store-and-forward reference cannot be remapped to the scale-down target (no matching remote queue binding),
-    * an anycast message must be re-routed as if newly received and the source reference acknowledged.
+    * A store-and-forward reference whose remote queue id resolves to a routing name must be routed directly to the
+    * remote queue binding with the same routing name on the scale-down target, keeping the application address, and
+    * the source reference acknowledged.
     */
    @Test
-   public void moveReferencesBetweenSnFQueuesReRoutesAnycastMiss() throws Exception {
+   public void moveReferencesBetweenSnFQueuesRoutesDirectlyToTarget() throws Exception {
       PostOffice postOffice = Mockito.mock(PostOffice.class);
-      // no remote queue bindings exist, so every route ID misses its scale-down target
-      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.<Binding>empty());
-
       QueueImpl snf = createSnFQueue(postOffice);
-      snf.addTail(createSnFReference(snf, 1, RoutingType.ANYCAST));
 
-      snf.moveReferencesBetweenSnFQueues(SimpleString.of("non-existent-target"));
+      RemoteQueueBinding sourceBinding = createRemoteBinding(snf, 1L, "routingName");
+      RemoteQueueBinding targetBinding = createRemoteBinding(createRemoteQueue("sf.myCluster.targetNode"), 7L, "routingName");
+      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.of(sourceBinding, targetBinding));
 
-      // re-routed as a fresh send with duplicate detection disabled (the original was already routed here) ...
-      Mockito.verify(postOffice).route(Mockito.any(Message.class), Mockito.any(Transaction.class), Mockito.eq(false), Mockito.eq(false));
-      // ... and the source reference is acknowledged and removed
+      snf.addTail(createSnFReference(snf, 1, RoutingType.MULTICAST));
+
+      snf.moveReferencesBetweenSnFQueues("targetNode");
+
+      ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
+      Mockito.verify(targetBinding).route(captor.capture(), Mockito.any(RoutingContext.class));
+      assertEquals(SNF_MESSAGE_ADDRESS, captor.getValue().getAddressSimpleString(),
+                   "the routed copy must carry the application address, not the SnF queue address");
+      Mockito.verify(sourceBinding, Mockito.never()).route(Mockito.any(Message.class), Mockito.any(RoutingContext.class));
+      Mockito.verify(postOffice).processRoute(Mockito.any(Message.class), Mockito.any(RoutingContext.class), Mockito.eq(false));
       assertEquals(0, snf.getMessageCount());
    }
 
    /**
-    * The re-routed copy must carry the application address of the message, not the (internal) SnF queue address,
-    * otherwise the fallback would route against the {@code sf.*} address and never reach the real queues.
+    * When the remote queue id cannot be resolved, an anycast message is routed using its address as routing name.
     */
    @Test
-   public void moveReferencesBetweenSnFQueuesReRoutesUsingApplicationAddress() throws Exception {
+   public void moveReferencesBetweenSnFQueuesRoutesAnycastUsingAddressWhenIdUnresolved() throws Exception {
+      PostOffice postOffice = Mockito.mock(PostOffice.class);
+      QueueImpl snf = createSnFQueue(postOffice);
+
+      RemoteQueueBinding targetBinding = createRemoteBinding(createRemoteQueue("sf.myCluster.targetNode"), 7L, SNF_MESSAGE_ADDRESS.toString());
+      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.of(targetBinding));
+
+      snf.addTail(createSnFReference(snf, 1, RoutingType.ANYCAST));
+
+      snf.moveReferencesBetweenSnFQueues("targetNode");
+
+      Mockito.verify(targetBinding).route(Mockito.any(Message.class), Mockito.any(RoutingContext.class));
+      Mockito.verify(postOffice).processRoute(Mockito.any(Message.class), Mockito.any(RoutingContext.class), Mockito.eq(false));
+      assertEquals(0, snf.getMessageCount());
+   }
+
+   /**
+    * When no binding matches the routing name an anycast message is left on the source SnF instead of being
+    * acknowledged: the message is not re-routed and the address-settings for unroutable messages do not apply.
+    */
+   @Test
+   public void moveReferencesBetweenSnFQueuesLeavesAnycastMiss() throws Exception {
       PostOffice postOffice = Mockito.mock(PostOffice.class);
       Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.<Binding>empty());
 
-      // the SnF queue address (sf.myCluster.target) is deliberately different from the message application address
       QueueImpl snf = createSnFQueue(postOffice);
       snf.addTail(createSnFReference(snf, 1, RoutingType.ANYCAST));
 
-      snf.moveReferencesBetweenSnFQueues(SimpleString.of("non-existent-target"));
+      snf.moveReferencesBetweenSnFQueues("non-existent-target");
 
-      ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
-      Mockito.verify(postOffice).route(captor.capture(), Mockito.any(Transaction.class), Mockito.eq(false), Mockito.eq(false));
-      assertEquals(SNF_MESSAGE_ADDRESS, captor.getValue().getAddressSimpleString(),
-                   "the re-routed copy must carry the application address, not the SnF queue address");
+      Mockito.verify(postOffice, Mockito.never()).route(Mockito.any(Message.class), Mockito.any(Transaction.class), Mockito.anyBoolean(), Mockito.anyBoolean());
+      Mockito.verify(postOffice, Mockito.never()).processRoute(Mockito.any(Message.class), Mockito.any(RoutingContext.class), Mockito.anyBoolean());
+      assertEquals(1, snf.getMessageCount());
+   }
+
+   /**
+    * A disabled remote queue binding must never be selected as a target.
+    */
+   @Test
+   public void moveReferencesBetweenSnFQueuesIgnoresDisabledTarget() throws Exception {
+      PostOffice postOffice = Mockito.mock(PostOffice.class);
+      QueueImpl snf = createSnFQueue(postOffice);
+
+      RemoteQueueBinding disabledTarget = createRemoteBinding(createRemoteQueue("sf.myCluster.targetNode"), 7L, SNF_MESSAGE_ADDRESS.toString());
+      Mockito.when(disabledTarget.isEnabled()).thenReturn(false);
+      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.of(disabledTarget));
+
+      snf.addTail(createSnFReference(snf, 1, RoutingType.ANYCAST));
+
+      snf.moveReferencesBetweenSnFQueues("targetNode");
+
+      Mockito.verify(disabledTarget, Mockito.never()).route(Mockito.any(Message.class), Mockito.any(RoutingContext.class));
+      assertEquals(1, snf.getMessageCount());
    }
 
    /**
     * {@code remoteQueueID} is node-local, so the same id can belong to remote queue bindings toward different nodes.
-    * {@code locateTargetBinding} must only consider the binding that belongs to the SnF queue being drained; otherwise a
+    * The routing name must only be resolved from the binding that belongs to the SnF queue being drained; otherwise a
     * colliding id from another node's binding would resolve the wrong routing name and misroute the message.
     */
    @Test
@@ -130,55 +174,41 @@ public class QueueImplTest {
       QueueImpl snf = createSnFQueue(postOffice);
 
       // the binding that actually belongs to the SnF queue being drained
-      RemoteQueueBinding sourceBinding = Mockito.mock(RemoteQueueBinding.class);
-      Mockito.when(sourceBinding.getQueue()).thenReturn(snf);
-      Mockito.when(sourceBinding.getRemoteQueueID()).thenReturn(42L);
-      Mockito.when(sourceBinding.getRoutingName()).thenReturn(SimpleString.of("correct"));
-
+      RemoteQueueBinding sourceBinding = createRemoteBinding(snf, 42L, "correct");
       // a different queue's binding that happens to share the same node-local remote queue id
-      Queue otherQueue = Mockito.mock(Queue.class);
-      Mockito.when(otherQueue.getName()).thenReturn(SimpleString.of("sf.myCluster.other"));
-      RemoteQueueBinding collidingBinding = Mockito.mock(RemoteQueueBinding.class);
-      Mockito.when(collidingBinding.getQueue()).thenReturn(otherQueue);
-      Mockito.when(collidingBinding.getRemoteQueueID()).thenReturn(42L);
-      Mockito.when(collidingBinding.getRoutingName()).thenReturn(SimpleString.of("wrong"));
-
+      RemoteQueueBinding collidingBinding = createRemoteBinding(createRemoteQueue("sf.myCluster.other"), 42L, "wrong");
       // a target on the scale-down node, but only for the colliding binding's (wrong) routing name
-      Queue targetQueue = Mockito.mock(Queue.class);
-      Mockito.when(targetQueue.getName()).thenReturn(SimpleString.of("sf.myCluster.targetNode"));
-      RemoteQueueBinding wrongTarget = Mockito.mock(RemoteQueueBinding.class);
-      Mockito.when(wrongTarget.getQueue()).thenReturn(targetQueue);
-      Mockito.when(wrongTarget.getRoutingName()).thenReturn(SimpleString.of("wrong"));
+      RemoteQueueBinding wrongTarget = createRemoteBinding(createRemoteQueue("sf.myCluster.targetNode"), 7L, "wrong");
 
       Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.of(sourceBinding, collidingBinding, wrongTarget));
-      Mockito.when(postOffice.getAddressInfo(SNF_MESSAGE_ADDRESS)).thenReturn(new AddressInfo(SNF_MESSAGE_ADDRESS, EnumSet.of(RoutingType.ANYCAST)));
 
       snf.addTail(createSnFReference(snf, 42, RoutingType.ANYCAST));
 
-      snf.moveReferencesBetweenSnFQueues(SimpleString.of("targetNode"));
+      snf.moveReferencesBetweenSnFQueues("targetNode");
 
-      // the colliding binding ("wrong") must not resolve a target; the message's real routing name ("correct") has no
-      // target, so this is a clean miss handled by the anycast re-route, never a directed route to the wrong target
+      // the message's real routing name ("correct") has no target: it is left in place, never routed to the wrong target
       Mockito.verify(wrongTarget, Mockito.never()).route(Mockito.any(Message.class), Mockito.any(RoutingContext.class));
-      Mockito.verify(postOffice).route(Mockito.any(Message.class), Mockito.any(Transaction.class), Mockito.eq(false), Mockito.eq(false));
+      assertEquals(1, snf.getMessageCount());
    }
 
    /**
-    * A multicast store-and-forward message is only the slice already chosen for the departing node's subscriptions, so
-    * on a remap miss it must not be re-routed on the whole address (duplicate risk) and must be left on the source SnF
-    * rather than acknowledging a message that was not moved.
+    * A multicast store-and-forward message with an unresolved remote queue id is only the slice already chosen for the
+    * departing node's subscriptions, so it must not be routed by address (duplicate risk) and must be left on the
+    * source SnF rather than acknowledging a message that was not moved.
     */
    @Test
    public void moveReferencesBetweenSnFQueuesLeavesMulticastMiss() throws Exception {
       PostOffice postOffice = Mockito.mock(PostOffice.class);
-      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.<Binding>empty());
+      RemoteQueueBinding addressTarget = createRemoteBinding(createRemoteQueue("sf.myCluster.targetNode"), 7L, SNF_MESSAGE_ADDRESS.toString());
+      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.of(addressTarget));
 
       QueueImpl snf = createSnFQueue(postOffice);
       snf.addTail(createSnFReference(snf, 1, RoutingType.MULTICAST));
 
-      snf.moveReferencesBetweenSnFQueues(SimpleString.of("non-existent-target"));
+      snf.moveReferencesBetweenSnFQueues("targetNode");
 
-      Mockito.verify(postOffice, Mockito.never()).route(Mockito.any(Message.class), Mockito.any(Transaction.class), Mockito.anyBoolean(), Mockito.anyBoolean());
+      Mockito.verify(addressTarget, Mockito.never()).route(Mockito.any(Message.class), Mockito.any(RoutingContext.class));
+      Mockito.verify(postOffice, Mockito.never()).processRoute(Mockito.any(Message.class), Mockito.any(RoutingContext.class), Mockito.anyBoolean());
       assertEquals(1, snf.getMessageCount());
    }
 
@@ -190,54 +220,73 @@ public class QueueImplTest {
    @Test
    public void moveReferencesBetweenSnFQueuesLeavesMulticastMissWhenRoutingTypeUnset() throws Exception {
       PostOffice postOffice = Mockito.mock(PostOffice.class);
-      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.<Binding>empty());
+      RemoteQueueBinding addressTarget = createRemoteBinding(createRemoteQueue("sf.myCluster.targetNode"), 7L, SNF_MESSAGE_ADDRESS.toString());
+      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.of(addressTarget));
       Mockito.when(postOffice.getAddressInfo(SNF_MESSAGE_ADDRESS)).thenReturn(new AddressInfo(SNF_MESSAGE_ADDRESS, EnumSet.of(RoutingType.MULTICAST)));
 
       QueueImpl snf = createSnFQueue(postOffice);
       snf.addTail(createSnFReference(snf, 1, null));
 
-      snf.moveReferencesBetweenSnFQueues(SimpleString.of("non-existent-target"));
+      snf.moveReferencesBetweenSnFQueues("targetNode");
 
-      Mockito.verify(postOffice, Mockito.never()).route(Mockito.any(Message.class), Mockito.any(Transaction.class), Mockito.anyBoolean(), Mockito.anyBoolean());
+      Mockito.verify(addressTarget, Mockito.never()).route(Mockito.any(Message.class), Mockito.any(RoutingContext.class));
       assertEquals(1, snf.getMessageCount());
    }
 
    /**
     * When the message has no routing type and the address is anycast-only, the anycast path is used: the message is
-    * re-routed and the source reference acknowledged.
+    * routed by address and the source reference acknowledged.
     */
    @Test
-   public void moveReferencesBetweenSnFQueuesReRoutesAnycastMissWhenRoutingTypeUnset() throws Exception {
+   public void moveReferencesBetweenSnFQueuesRoutesAnycastWhenRoutingTypeUnset() throws Exception {
       PostOffice postOffice = Mockito.mock(PostOffice.class);
-      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.<Binding>empty());
+      RemoteQueueBinding addressTarget = createRemoteBinding(createRemoteQueue("sf.myCluster.targetNode"), 7L, SNF_MESSAGE_ADDRESS.toString());
+      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.of(addressTarget));
       Mockito.when(postOffice.getAddressInfo(SNF_MESSAGE_ADDRESS)).thenReturn(new AddressInfo(SNF_MESSAGE_ADDRESS, EnumSet.of(RoutingType.ANYCAST)));
 
       QueueImpl snf = createSnFQueue(postOffice);
       snf.addTail(createSnFReference(snf, 1, null));
 
-      snf.moveReferencesBetweenSnFQueues(SimpleString.of("non-existent-target"));
+      snf.moveReferencesBetweenSnFQueues("targetNode");
 
-      Mockito.verify(postOffice).route(Mockito.any(Message.class), Mockito.any(Transaction.class), Mockito.eq(false), Mockito.eq(false));
+      Mockito.verify(addressTarget).route(Mockito.any(Message.class), Mockito.any(RoutingContext.class));
       assertEquals(0, snf.getMessageCount());
    }
 
    /**
     * When the message has no routing type and the address is unknown (no {@code AddressInfo}), the anycast path is used
-    * by default: there is nothing left to route to, so re-routing is harmless and the source reference is acknowledged.
+    * by default: the message is routed by address and the source reference acknowledged.
     */
    @Test
-   public void moveReferencesBetweenSnFQueuesReRoutesWhenRoutingTypeAndAddressUnset() throws Exception {
+   public void moveReferencesBetweenSnFQueuesRoutesWhenRoutingTypeAndAddressUnset() throws Exception {
       PostOffice postOffice = Mockito.mock(PostOffice.class);
-      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.<Binding>empty());
+      RemoteQueueBinding addressTarget = createRemoteBinding(createRemoteQueue("sf.myCluster.targetNode"), 7L, SNF_MESSAGE_ADDRESS.toString());
+      Mockito.when(postOffice.getAllBindings()).thenAnswer(invocation -> Stream.of(addressTarget));
       // getAddressInfo is left returning null (the mock default): the address is unknown
 
       QueueImpl snf = createSnFQueue(postOffice);
       snf.addTail(createSnFReference(snf, 1, null));
 
-      snf.moveReferencesBetweenSnFQueues(SimpleString.of("non-existent-target"));
+      snf.moveReferencesBetweenSnFQueues("targetNode");
 
-      Mockito.verify(postOffice).route(Mockito.any(Message.class), Mockito.any(Transaction.class), Mockito.eq(false), Mockito.eq(false));
+      Mockito.verify(addressTarget).route(Mockito.any(Message.class), Mockito.any(RoutingContext.class));
       assertEquals(0, snf.getMessageCount());
+   }
+
+   private Queue createRemoteQueue(String name) {
+      Queue queue = Mockito.mock(Queue.class);
+      Mockito.when(queue.getName()).thenReturn(SimpleString.of(name));
+      return queue;
+   }
+
+   private RemoteQueueBinding createRemoteBinding(Queue queue, long remoteQueueID, String routingName) {
+      RemoteQueueBinding binding = Mockito.mock(RemoteQueueBinding.class);
+      Mockito.when(binding.getQueue()).thenReturn(queue);
+      Mockito.when(binding.getRemoteQueueID()).thenReturn(remoteQueueID);
+      Mockito.when(binding.getRoutingName()).thenReturn(SimpleString.of(routingName));
+      // a Mockito mock does not call the Binding.isEnabled() default method
+      Mockito.when(binding.isEnabled()).thenReturn(true);
+      return binding;
    }
 
    private QueueImpl createSnFQueue(PostOffice postOffice) throws Exception {

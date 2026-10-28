@@ -21,7 +21,6 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.activemq.artemis.api.core.RoutingType;
-import org.apache.activemq.artemis.api.core.SimpleString;
 import org.apache.activemq.artemis.api.core.client.ClientMessage;
 import org.apache.activemq.artemis.core.postoffice.impl.LocalQueueBinding;
 import org.apache.activemq.artemis.core.server.ActiveMQServer;
@@ -35,14 +34,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * End-to-end coverage of the store-and-forward (SnF) scale-down relocate fallback in
- * {@link QueueImpl#moveReferencesBetweenSnFQueues(SimpleString)}: when the scale-down target binding is missing, an
- * anycast message is re-routed as if newly received.
+ * End-to-end coverage of the store-and-forward (SnF) scale-down relocation in
+ * {@link QueueImpl#moveReferencesBetweenSnFQueues(String)}: each SnF reference is routed directly to the binding of the
+ * scale-down target that has the same routing name, here the local queue binding of the draining node itself.
  * <p>
  * This exercises the parts that cannot be covered with mocks: the SnF message really carries the application address
- * (so the re-route reaches the real queue), and duplicate detection is disabled on the re-route (the message was
- * already routed through this node when produced, so its duplicate id is cached and would otherwise reject the
- * relocation, losing the message).
+ * and the remote queue ids resolve to the real bindings, so the directed route reaches the real queue and the source
+ * references are acknowledged.
  */
 public class ScaleDownSnFRelocateTest extends ClusterTestBase {
 
@@ -70,7 +68,7 @@ public class ScaleDownSnFRelocateTest extends ClusterTestBase {
    }
 
    @Test
-   public void testAnycastRelocateMissReRoutesToApplicationAddressWithDuplicateDetection() throws Exception {
+   public void testAnycastRelocateRoutesDirectlyToLocalTargetBinding() throws Exception {
       final int messageCount = 10;
 
       createQueue(0, ADDRESS, QUEUE, null, true, RoutingType.ANYCAST);
@@ -84,7 +82,7 @@ public class ScaleDownSnFRelocateTest extends ClusterTestBase {
       Queue snf = getSnFQueue(servers[0], servers[1]);
       snf.pause();
 
-      // send with duplicate detection ids: this populates node 0's duplicate id cache at produce time
+      // send with duplicate detection ids, as a real producer would
       AtomicInteger duplicateDetectionSeq = new AtomicInteger(0);
       send(0, ADDRESS, messageCount, true, null, RoutingType.ANYCAST, duplicateDetectionSeq);
       Wait.assertEquals(messageCount, () -> getMessageCount(snf), 5000);
@@ -92,18 +90,18 @@ public class ScaleDownSnFRelocateTest extends ClusterTestBase {
       // fence the departing node's binding exactly as the scale-down drain does before moving the references
       servers[0].getClusterManager().getClusterConnection(CLUSTER_NAME).disableRecord(servers[1].getNodeID().toString());
 
-      // give node 0's local queue demand so the anycast re-route has somewhere to land
+      // give node 0's local queue demand so the directed route has somewhere to land
       addConsumer(1, 0, QUEUE, null);
       waitForBindings(0, ADDRESS, 1, 1, true);
 
-      // relocate toward a node that has no binding -> every reference misses -> anycast re-route fallback
-      ((QueueImpl) snf).moveReferencesBetweenSnFQueues(SimpleString.of("non-existent-target"));
+      // relocate toward node 0 itself: every reference is routed directly to node 0's local queue binding
+      ((QueueImpl) snf).moveReferencesBetweenSnFQueues(servers[0].getNodeID().toString());
 
-      // all messages must be delivered to node 0's local queue: proves the re-route used the application address and
-      // that duplicate detection did not reject the relocation despite the ids cached at produce time
+      // all messages must be delivered to node 0's local queue: proves the directed route used the application
+      // address and the real binding
       for (int i = 0; i < messageCount; i++) {
          ClientMessage message = consumers[1].getConsumer().receive(5000);
-         assertNotNull(message, "message " + i + " should be re-routed to the local queue on node 0");
+         assertNotNull(message, "message " + i + " should be routed to the local queue on node 0");
          message.acknowledge();
       }
 
