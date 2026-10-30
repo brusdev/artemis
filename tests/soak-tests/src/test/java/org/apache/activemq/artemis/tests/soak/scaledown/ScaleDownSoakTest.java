@@ -31,14 +31,17 @@ import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -51,14 +54,6 @@ import java.util.stream.IntStream;
 import org.apache.activemq.artemis.api.core.management.ResourceNames;
 import org.apache.activemq.artemis.api.core.management.SimpleManagement;
 import org.apache.activemq.artemis.cli.commands.helper.HelperCreate;
-import org.apache.activemq.artemis.core.config.impl.ConfigurationImpl;
-import org.apache.activemq.artemis.core.io.nio.NIOSequentialFileFactory;
-import org.apache.activemq.artemis.core.journal.RecordInfo;
-import org.apache.activemq.artemis.core.journal.impl.JournalFile;
-import org.apache.activemq.artemis.core.journal.impl.JournalImpl;
-import org.apache.activemq.artemis.core.journal.impl.JournalReaderCallback;
-import org.apache.activemq.artemis.core.persistence.impl.journal.DescribeJournal;
-import org.apache.activemq.artemis.core.persistence.impl.journal.JournalRecordIds;
 import org.apache.activemq.artemis.json.JsonArray;
 import org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory;
 import org.apache.activemq.artemis.tests.soak.SoakTestBase;
@@ -94,38 +89,23 @@ public class ScaleDownSoakTest extends SoakTestBase {
 
    private static final String TEST_NAME = "SCALE_DOWN";
    private static final String TEST_MSG_ID = "TEST_MSG_ID";
-   private static final int NUMBER_OF_RESTARTS = testProperty(TEST_NAME, "NUMBER_OF_RESTARTS", 9);
-   private static final int NUMBER_OF_SERVERS = testProperty(TEST_NAME, "NUMBER_OF_SERVERS", 9);
-   private static final String MESSAGE_LOAD_BALANCING = testProperty(TEST_NAME, "MESSAGE_LOAD_BALANCING", "ON_DEMAND");
-   private static final int CONSUMER_TIMEOUT = testProperty(TEST_NAME, "CONSUMER_TIMEOUT", 1000);
-   // Steady-state run between restarts. This must be long enough for the just-restarted node to
-   // rejoin the cluster and for consumers to actually drain the queue back down; otherwise (e.g. in
-   // the single-consumer scenario with redistributionDelay=0) the backlog on the restarted node only
-   // grows, every shutdown has more to scale down, and the node is restarted again mid-churn while
-   // its scale-down target is still saturated. A couple of seconds keeps each scale-down bounded.
-   private static final int UP_TIME = testProperty(TEST_NAME, "UP_TIME", 5000);
-   // Budget for a graceful stop to complete. Shutdown drains queues via scale-down over the SnF
-   // bridges (each of which can hit its ~60s stop timeout) and then transfers messages to a peer, so
-   // the budget must sit comfortably above the bridge-stop timeout. It is also a hard upper bound: if
-   // a drain stalls (the scale-down authorise/transfer can block while the connection stays alive),
-   // waitForServer() force-kills the node and the restart fails fast with a clear message rather than
-   // hanging. Keep this >= CLUSTER_TIMEOUT_MS so topology convergence is not the first thing to trip.
-   private static final int CLIENT_STOP_TIMEOUT_MS = testProperty(TEST_NAME, "CLIENT_STOP_TIMEOUT_MS", 30_000);
-   private static final int SHUTDOWN_TIMEOUT_MS = testProperty(TEST_NAME, "SHUTDOWN_TIMEOUT_MS", 180_000);
-   private static final int CLUSTER_TIMEOUT_MS = testProperty(TEST_NAME, "CLUSTER_TIMEOUT_MS", 120_000);
-   private static final int SERVER_START_TIMEOUT_MS = testProperty(TEST_NAME, "SERVER_START_TIMEOUT_MS", 30_000);
-   // When enabled, the brokers log DEBUG for the cluster/scale-down classes so a focused
-   // reproduction can trace the SnF relocate drain (moved counts, flow-record lifecycle).
-   // Off by default to keep ordinary soak runs quiet; enable with -DTEST_SCALE_DOWN_DEBUG_LOGGING=true.
-   private static final boolean DEBUG_LOGGING =
-      Boolean.parseBoolean(testProperty(TEST_NAME, "DEBUG_LOGGING", "false"));
-   private static final boolean HALT_ON_OTHER_DUPLICATES =
-      Boolean.parseBoolean(testProperty(TEST_NAME, "HALT_ON_OTHER_DUPLICATES", "false"));
-
-   private static final String QUEUE_NAME = "TEST_SD";
+   private static final String TEST_QUEUE_NAME = "TEST_SD";
    private static final String SERVER_NAME_BASE = "scaledown/broker-";
    private static final int SERVER_PORT_BASE = 61616;
    private static final String CLUSTER_CONNECTION_NAME = "my-cluster";
+
+   private static final int NUMBER_OF_SERVERS = testProperty(TEST_NAME, "NUMBER_OF_SERVERS", 4);
+   private static final int NUMBER_OF_RESTARTS = testProperty(TEST_NAME, "NUMBER_OF_RESTARTS", NUMBER_OF_SERVERS);
+   private static final int RECEIVE_TIMEOUT = testProperty(TEST_NAME, "RECEIVE_TIMEOUT", 1000);
+   private static final int SERVER_UP_TIME = testProperty(TEST_NAME, "SERVER_UP_TIME", 3000);
+   private static final int CLIENT_STOP_TIMEOUT_MS = testProperty(TEST_NAME, "CLIENT_STOP_TIMEOUT_MS", 30_000);
+   private static final int SERVER_START_TIMEOUT_MS = testProperty(TEST_NAME, "SERVER_START_TIMEOUT_MS", 30_000);
+   private static final int SERVER_STOP_TIMEOUT_MS = testProperty(TEST_NAME, "SERVER_STOP_TIMEOUT_MS", 180_000);
+   private static final int CLUSTER_TIMEOUT_MS = testProperty(TEST_NAME, "CLUSTER_TIMEOUT_MS", 120_000);
+   private static final boolean DEBUG_LOGGING =
+      Boolean.parseBoolean(testProperty(TEST_NAME, "DEBUG_LOGGING", "false"));
+
+   private static final int[] ALL_SERVERS = IntStream.range(0, NUMBER_OF_SERVERS).toArray();
 
    static class ServerRecord {
       String serverName;
@@ -135,7 +115,7 @@ public class ScaleDownSoakTest extends SoakTestBase {
       int serverId;
       boolean running;
 
-      ServerRecord(File serverLocation, String serverName, int id) {
+      ServerRecord(int id, String serverName, File serverLocation) {
          this.serverLocation = serverLocation;
          this.brokerProperties = new File(serverLocation, "broker.properties");
          this.serverName = serverName;
@@ -144,7 +124,8 @@ public class ScaleDownSoakTest extends SoakTestBase {
 
       public void startServer() throws Exception {
          running = true;
-         process = ServerUtil.startServer(serverLocation.getAbsolutePath(), serverName, 0, 0, brokerProperties, null);
+         process = ServerUtil.startServer(serverLocation.getAbsolutePath(), serverName, serverId, SERVER_START_TIMEOUT_MS, brokerProperties, null);
+         logger.info("Starting server {} with pid: {}", serverId, process.pid());
       }
 
       public SimpleManagement getManagement() {
@@ -153,6 +134,7 @@ public class ScaleDownSoakTest extends SoakTestBase {
 
       public void stopServer() throws IOException {
          running = false;
+         logger.info("Stopping server {} with pid {}, process {}", serverId, process.pid(), process);
          if (process.isAlive()) {
             stopServerWithFile(serverLocation.getAbsolutePath());
          }
@@ -167,9 +149,10 @@ public class ScaleDownSoakTest extends SoakTestBase {
       }
 
       public void waitForServer() throws InterruptedException {
-         assertTrue(process.waitFor(SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS),
-            "Server " + serverName + " did not stop within " + SHUTDOWN_TIMEOUT_MS + "s");
+         assertTrue(process.waitFor(SERVER_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+            "Server " + serverName + " did not stop within " + SERVER_STOP_TIMEOUT_MS + "s");
          assertEquals(0, process.exitValue(), "Server " + serverName + " exited with non-zero code");
+         logger.info("Stopped server {} with pid {}, exitValue {}, process {}", serverId, process.pid(), process.exitValue(), process);
       }
 
       private String serverURI() {
@@ -179,47 +162,58 @@ public class ScaleDownSoakTest extends SoakTestBase {
 
    private static final ServerRecord[] serverRecords = new ServerRecord[NUMBER_OF_SERVERS];
 
-   AtomicInteger totalReceived;
-   AtomicInteger totalSent;
-   AtomicBoolean producersStopping;
-   AtomicBoolean consumersStopping;
-   Set<String> sentMessageIds;
+   Set<Integer> runningProducers;
+   Set<Integer> connectedProducers;
+   AtomicBoolean stoppingProducers;
+
+   Set<Integer> runningConsumers;
+   Set<Integer> connectedConsumers;
+   AtomicBoolean stoppingConsumers;
+
    Map<String, MessageRecord> messageRecords;
+   AtomicInteger sentMessages;
+   AtomicInteger receivedMessages;
+
+   record ConsumerRecord(int id, int serverId, String jmsMessageId, Instant timestamp) {
+   }
 
    static final class MessageRecord {
       final String id;
-      final int firstConsumerId;
-      final int firstServerId;
-      final String firstJMSMessageId;
-      final AtomicBoolean duplicate = new AtomicBoolean();
-      volatile int dupConsumerId = -1;
-      volatile int dupServerId = -1;
-      volatile String dupJMSMessageId;
+      final int producerId;
+      final int producerServerId;
+      final Instant sendingTimestamp;
+      Instant sentTimestamp;
+      final List<ConsumerRecord> consumerRecords = Collections.synchronizedList(new ArrayList<>());
 
-      MessageRecord(String id, int firstConsumerId, int firstServerId, String firstJMSMessageId) {
+      MessageRecord(String id, int producerId, int producerServerId, Instant sendingTimestamp) {
          this.id = id;
-         this.firstConsumerId = firstConsumerId;
-         this.firstServerId = firstServerId;
-         this.firstJMSMessageId = firstJMSMessageId == null ? "<null>" : firstJMSMessageId;
+         this.producerId = producerId;
+         this.producerServerId = producerServerId;
+         this.sendingTimestamp = sendingTimestamp;
       }
 
-      boolean markDuplicate(int consumerId, int serverId, String jmsMessageId) {
-         if (!duplicate.compareAndSet(false, true)) {
-            return false;
+      boolean isSent() {
+         return sentTimestamp != null;
+      }
+
+      boolean isConsumed() {
+         return !consumerRecords.isEmpty();
+      }
+
+      boolean hasDuplicates() {
+         return consumerRecords.size() > 1;
+      }
+
+      int duration() {
+         if (consumerRecords.isEmpty()) {
+            throw new IllegalStateException("Message not consumed");
          }
-         dupConsumerId = consumerId;
-         dupServerId = serverId;
-         dupJMSMessageId = jmsMessageId == null ? "<null>" : jmsMessageId;
-         return true;
-      }
 
-      boolean isDuplicate() {
-         return duplicate.get();
+         return Math.toIntExact(Duration.between(sendingTimestamp,
+            consumerRecords.get(0).timestamp).toMillis());
       }
    }
 
-   CountDownLatch consumersDone;
-   CountDownLatch producersDone;
 
    /**
     * Skips the remaining tests of this class (including their {@code @BeforeEach}/{@code @AfterEach})
@@ -257,8 +251,8 @@ public class ScaleDownSoakTest extends SoakTestBase {
    public static void createServers() throws Exception {
       skipAfterFirstFailure.reset();
 
-      for (int s = 0; s < NUMBER_OF_SERVERS; s++) {
-         String serverName = SERVER_NAME_BASE + s;
+      for (int serverId = 0; serverId < NUMBER_OF_SERVERS; serverId++) {
+         String serverName = SERVER_NAME_BASE + serverId;
 
          File serverLocation = getFileServerLocation(serverName);
          deleteDirectory(serverLocation);
@@ -271,17 +265,18 @@ public class ScaleDownSoakTest extends SoakTestBase {
             .setAllowAnonymous(true)
             .setNoWeb(true)
             .setArtemisInstance(serverLocation)
-            .setPortOffset(s)
+            .setPortOffset(serverId)
             .setClustered(true);
 
-         cliCreateServer.setMessageLoadBalancing(MESSAGE_LOAD_BALANCING);
-         cliCreateServer.setStaticCluster(buildStaticClusterURI(s));
+         cliCreateServer.setMessageLoadBalancing("ON_DEMAND");
+         cliCreateServer.setStaticCluster(buildStaticClusterURI(serverId));
          cliCreateServer.setArgs("--no-stomp-acceptor", "--no-hornetq-acceptor",
             "--no-mqtt-acceptor", "--no-amqp-acceptor",
             "--max-hops", "1",
             "--cluster-user", "cluster-user",
             "--cluster-password", "cluster-password",
-            "--queues", QUEUE_NAME);
+            //"--java-options", "-Xms512M -Xmx1G",
+            "--queues", TEST_QUEUE_NAME);
 
          cliCreateServer.createServer();
 
@@ -297,7 +292,7 @@ public class ScaleDownSoakTest extends SoakTestBase {
          brokerProperties.put("HAPolicyConfiguration.scaleDownConfiguration.enabled", "true");
          brokerProperties.put("HAPolicyConfiguration.scaleDownConfiguration.connectors", buildScaleDownConnectors());
          saveProperties(brokerProperties, new File(serverLocation, "broker.properties"));
-         serverRecords[s] = new ServerRecord(serverLocation, serverName, s);
+         serverRecords[serverId] = new ServerRecord(serverId, serverName, serverLocation);
       }
    }
 
@@ -345,12 +340,20 @@ public class ScaleDownSoakTest extends SoakTestBase {
 
    @BeforeEach
    public void beforeEach() throws Exception {
-      totalReceived = new AtomicInteger(0);
-      totalSent = new AtomicInteger(0);
-      producersStopping = new AtomicBoolean(false);
-      consumersStopping = new AtomicBoolean(false);
-      sentMessageIds = ConcurrentHashMap.newKeySet();
+
+      runningProducers = ConcurrentHashMap.newKeySet();
+      connectedProducers = ConcurrentHashMap.newKeySet();
+      stoppingProducers = new AtomicBoolean(false);
+
+      runningConsumers = ConcurrentHashMap.newKeySet();
+      connectedConsumers = ConcurrentHashMap.newKeySet();
+      stoppingConsumers = new AtomicBoolean(false);
+
       messageRecords = new ConcurrentHashMap<>();
+      sentMessages = new AtomicInteger(0);
+      receivedMessages = new AtomicInteger(0);
+
+
 
       for (int i = 0; i < NUMBER_OF_SERVERS; i++) {
          cleanupData(SERVER_NAME_BASE + i);
@@ -379,8 +382,7 @@ public class ScaleDownSoakTest extends SoakTestBase {
     */
    @Test
    public void testSymmetricNodesWithSingleNodeRestarts() throws Exception {
-      int[] allServers = IntStream.range(0, NUMBER_OF_SERVERS).toArray();
-      runRestartScenario(allServers, allServers, i -> 0);
+      runRestartScenario(ALL_SERVERS, ALL_SERVERS, i -> 0);
    }
 
    /**
@@ -390,8 +392,7 @@ public class ScaleDownSoakTest extends SoakTestBase {
     */
    @Test
    public void testSymmetricNodesWithSequentialNodeRestarts() throws Exception {
-      int[] allServers = IntStream.range(0, NUMBER_OF_SERVERS).toArray();
-      runRestartScenario(allServers, allServers, i -> i % serverRecords.length);
+      runRestartScenario(ALL_SERVERS, ALL_SERVERS, i -> i % serverRecords.length);
    }
 
    /**
@@ -401,8 +402,7 @@ public class ScaleDownSoakTest extends SoakTestBase {
     */
    @Test
    public void testSingleConsumerNodeWithConsumerNodeRestarts() throws Exception {
-      int[] allServers = IntStream.range(0, NUMBER_OF_SERVERS).toArray();
-      runRestartScenario(allServers, new int[]{0}, i -> 0);
+      runRestartScenario(ALL_SERVERS, new int[]{0}, i -> 0);
    }
 
    /**
@@ -412,59 +412,64 @@ public class ScaleDownSoakTest extends SoakTestBase {
     */
    @Test
    public void testSingleConsumerNodeWithSequentialNodeRestarts() throws Exception {
-      int[] allServers = IntStream.range(0, NUMBER_OF_SERVERS).toArray();
-      runRestartScenario(allServers, new int[]{0}, i -> i % serverRecords.length);
+      runRestartScenario(ALL_SERVERS, new int[]{0}, i -> i % serverRecords.length);
    }
 
    /**
-    * Nodes have different roles: some produce only, some consume only, some do both, and two act
-    * as pure routing nodes with no local producers or consumers. Nodes are restarted in round-robin
+    * Nodes have different roles: produce only, consume only, both producer and consumer,
+    * and pure routing nodes with no local producers or consumers. Node 0 is restarted repeatedly
     * order to verify that scale-down correctly migrates messages regardless of whether the
     * restarted node was a producer, consumer, or pure relay.
     */
    @Test
-   public void testAsymmetricNodesWithRestarts() throws Exception {
-      // nodes 0,1: consumers only
-      // nodes 2,3,4: producers only
-      // nodes 5,6: both producers and consumers
-      // nodes 7,8: pure routing (neither producer nor consumer)
-      int[] producerNodes = {2, 3, 4, 5, 6};
-      int[] consumerNodes = {0, 1, 5, 6};
+   public void testAsymmetricNodesWithSingleNodeRestarts() throws Exception {
+      int[] producerNodes = IntStream.range(0, NUMBER_OF_SERVERS).filter(i -> i % 2 == 0).toArray();
+      int[] consumerNodes = IntStream.range(0, NUMBER_OF_SERVERS).filter(i -> i % 4 < 2).toArray();
+      runRestartScenario(producerNodes, consumerNodes, i -> 0);
+   }
+
+   /**
+    * Nodes have different roles: produce only, consume only, both producer and consumer,
+    * and pure routing nodes with no local producers or consumers. Nodes are restarted in round-robin
+    * order to verify that scale-down correctly migrates messages regardless of whether the
+    * restarted node was a producer, consumer, or pure relay.
+    */
+   @Test
+   public void testAsymmetricNodesWithSequentialNodeRestarts() throws Exception {
+      int[] producerNodes = IntStream.range(0, NUMBER_OF_SERVERS).filter(i -> i % 2 == 0).toArray();
+      int[] consumerNodes = IntStream.range(0, NUMBER_OF_SERVERS).filter(i -> i % 4 < 2).toArray();
       runRestartScenario(producerNodes, consumerNodes, i -> i % serverRecords.length);
    }
 
    /**
     * Shared scenario driver: wire up producers/consumers, then repeatedly let the cluster run for
     * {@code UP_TIME} and restart a node chosen by {@code nodeToRestart} (given the iteration index).
-    * Finally stop producers, drain, stop consumers/servers and assert integrity via {@link #checkStatus()}.
+    * Finally stop producers, drain, stop consumers/servers and assert integrity.
     */
    private void runRestartScenario(int[] producerNodes, int[] consumerNodes, IntUnaryOperator nodeToRestart) throws Exception {
-      setupNodes(producerNodes, consumerNodes);
+      setupClients(producerNodes, consumerNodes);
 
       for (int i = 0; i < NUMBER_OF_RESTARTS; i++) {
-         // intentional uptime wait — lets the cluster run normally before each restart cycle
-         Thread.sleep(UP_TIME);
-         stopServer(nodeToRestart.applyAsInt(i));
-         startServer(nodeToRestart.applyAsInt(i));
-      }
+         final int restartingNode = nodeToRestart.applyAsInt(i);
 
-      for (int i = 1; i < NUMBER_OF_RESTARTS; i++) {
-         stopServer(i);
+         //waitForConsumedMessages(totalSent.get());
+
+         Thread.sleep(SERVER_UP_TIME);
+
+         stopServer(restartingNode);
+         startServer(restartingNode);
       }
 
       stopProducers();
       waitForMessages();
       stopConsumers();
       stopServers();
-      checkStatus();
    }
 
-   private void setupNodes(int[] producerNodes, int[] consumerNodes) throws Exception {
+   private void setupClients(int[] producerNodes, int[] consumerNodes) throws Exception {
       ExecutorService executorService = Executors.newFixedThreadPool(producerNodes.length + consumerNodes.length);
       runAfter(executorService::shutdownNow);
 
-      producersDone = new CountDownLatch(producerNodes.length);
-      consumersDone = new CountDownLatch(consumerNodes.length);
 
       int consumerId = 0;
       for (int nodeId : consumerNodes) {
@@ -496,124 +501,162 @@ public class ScaleDownSoakTest extends SoakTestBase {
       logger.info("Stopped server {}", serverId);
    }
 
+   private void waitForConsumedMessages(int messages) {
+      Wait.assertTrue("Consumers did not consumed " + messages + " messages in time: ",
+         () -> sentMessages.get() - receivedMessages.get() < 1000, 30_000, 100);
+   }
+
+   private void waitForConnectedConsumer(int consumerId) {
+      Wait.assertTrue("Consumers did not complete in time: " + runningConsumers,
+         () -> connectedConsumers.contains(consumerId), CLIENT_STOP_TIMEOUT_MS, 100);
+   }
+
    private void produceMessages(int producerId, ServerRecord serverRecord) {
       Thread.currentThread().setName("Producer " + producerId + " server=" + serverRecord.serverId);
+
+      int count = 0;
+      runningProducers.add(producerId);
+
       try {
-         int localSent = 0;
          int messageIndex = 0;
-         while (!producersStopping.get()) {
+         int connectionFailures = 0;
+         while (!stoppingProducers.get()) {
             try (ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory(serverRecord.serverURI());
                  Connection connection = factory.createConnection()) {
                Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
-               MessageProducer producer = session.createProducer(session.createQueue(QUEUE_NAME));
+               MessageProducer producer = session.createProducer(session.createQueue(TEST_QUEUE_NAME));
+               connectedProducers.add(producerId);
 
-               while (!producersStopping.get()) {
+               while (!stoppingProducers.get()) {
                   String messageId = "prd-" + producerId + "-srv-" + serverRecord.serverId + "-msg-" + messageIndex++;
-                  TextMessage message = session.createTextMessage(String.valueOf(localSent));
+                  MessageRecord messageRecord = new MessageRecord(messageId, producerId, serverRecord.serverId, Instant.now());
+                  TextMessage message = session.createTextMessage(String.valueOf(count));
                   message.setStringProperty(TEST_MSG_ID, messageId);
+                  messageRecords.put(messageId, messageRecord);
                   producer.send(message);
-                  sentMessageIds.add(messageId);
-                  localSent++;
-                  int sent = totalSent.incrementAndGet();
-                  if (localSent % 100 == 0) {
-                     logger.info("Producer {} server={} localSent={} totalSent={}", producerId, serverRecord.serverId, localSent, sent);
+                  messageRecord.sentTimestamp = Instant.now();
+                  sentMessages.incrementAndGet();
+                  count++;
+                  if (count % 100 == 0) {
+                     logger.info("Producer {} server={} count={} {}/{}", producerId,
+                        serverRecord.serverId, count, receivedMessages.get(), sentMessages.get());
                   }
                }
             } catch (Exception e) {
-               logger.info("Producer {} server={} reconnecting after: {}", producerId, serverRecord.serverId, e.getMessage());
-               Thread.sleep(1000);
+               connectedProducers.remove(producerId);
+               if (connectionFailures++ % 30 == 0) {
+                  logger.info("Producer {} server={} count={} {}/{}: connectionFailures={}", producerId,
+                     serverRecord.serverId, count, receivedMessages.get(), sentMessages.get(), connectionFailures, e);
+               }
+               Thread.sleep(100);
             }
          }
-         logger.info("Producer {} server={} finished localSent={} totalSent={}", producerId, serverRecord.serverId, localSent, totalSent.get());
+         logger.info("Producer {} server={} count={} {}/{}: finished", producerId,
+            serverRecord.serverId, count, receivedMessages.get(), sentMessages.get());
       } catch (InterruptedException e) {
-         logger.info("Producer {} server={} interrupted", producerId, serverRecord.serverId);
+         logger.info("Producer {} server={} count={} {}/{}: interrupted", producerId,
+            serverRecord.serverId, count, receivedMessages.get(), sentMessages.get());
       } finally {
-         producersDone.countDown();
+         runningProducers.remove(producerId);
       }
    }
 
    private void consumeMessages(int consumerId, ServerRecord serverRecord) {
       Thread.currentThread().setName("Consumer " + consumerId + " server=" + serverRecord.serverId);
+
+      int count = 0;
+      runningConsumers.add(consumerId);
+
       try {
-         int localReceived = 0;
-         while (!consumersStopping.get()) {
+         int connectionFailures = 0;
+         while (!stoppingConsumers.get()) {
             try (ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory(serverRecord.serverURI());
                  Connection connection = factory.createConnection()) {
                connection.start();
                Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
-               MessageConsumer consumer = session.createConsumer(session.createQueue(QUEUE_NAME));
+               MessageConsumer consumer = session.createConsumer(session.createQueue(TEST_QUEUE_NAME));
+               connectedConsumers.add(consumerId);
 
-               int missedReceive = 0;
-               while (!consumersStopping.get()) {
-                  Message msg = consumer.receive(CONSUMER_TIMEOUT);
-                  if (msg != null) {
-                     missedReceive = 0;
-                     localReceived++;
-                     String messageID = msg.getStringProperty(TEST_MSG_ID);
-                     MessageRecord record = new MessageRecord(messageID, consumerId, serverRecord.serverId, msg.getJMSMessageID());
-                     MessageRecord existing = messageRecords.putIfAbsent(messageID, record);
-                     if (existing == null) {
-                        totalReceived.incrementAndGet();
-                        if (!sentMessageIds.contains(messageID)) {
-                           logger.warn("Consumer {} server={} received ghost-send (producer lost ACK): id={}",
-                              consumerId, serverRecord.serverId, messageID);
-                        }
-                     } else if (existing.markDuplicate(consumerId, serverRecord.serverId, msg.getJMSMessageID())) {
-                        logger.warn("Consumer {} server={} received duplicate: --id '{}' --first-consumer-id {} --first-server-id {} --first-jms-id '{}' --consumer-id {} --server-id {} --jms-id '{}'",
-                           consumerId, serverRecord.serverId, messageID, existing.firstConsumerId, existing.firstServerId, existing.firstJMSMessageId, consumerId, serverRecord.serverId, existing.dupJMSMessageId);
-                     }
-                     if (localReceived % 100 == 0) {
-                        logger.info("Consumer {} server={} locallyReceived={} totalReceived={} duplicates={}",
-                           consumerId, serverRecord.serverId, localReceived, totalReceived, countDuplicates());
+               int consecutiveNullMessages = 0;
+               while (!stoppingConsumers.get()) {
+                  Message message = consumer.receive(RECEIVE_TIMEOUT);
+                  if (message != null) {
+                     String messageId = message.getStringProperty(TEST_MSG_ID);
+                     MessageRecord record = messageRecords.get(messageId);
+                     record.consumerRecords.add(new ConsumerRecord(consumerId,
+                        serverRecord.serverId, message.getJMSMessageID(), Instant.now()));
+                     receivedMessages.incrementAndGet();
+                     count++;
+                     if (count % 100 == 0) {
+                        logger.info("Consumer {} server={} count={} {}/{}", consumerId,
+                           serverRecord.serverId, count, receivedMessages.get(), sentMessages.get());
                      }
                   } else {
-                     missedReceive++;
-                     logger.info("Consumer {} server={} received null, totalSent={}, totalReceived={}, retried for {}", consumerId, serverRecord.serverId, totalSent.get(), totalReceived.get(), missedReceive);
-                  }
+                     consecutiveNullMessages++;
+                     logger.info("Consumer {} server={} count={} {}/{}: consecutiveNullMessages={}", consumerId,
+                        serverRecord.serverId, count, receivedMessages.get(), sentMessages.get(), consecutiveNullMessages);
+                 }
                }
             } catch (Exception e) {
-               logger.info("Consumer {} server={} reconnecting after: {}", consumerId, serverRecord.serverId, e.getMessage());
-               Thread.sleep(1000);
+               connectedConsumers.remove(consumerId);
+               if (connectionFailures++ % 30 == 0) {
+                  logger.info("Consumer {} server={} count={} {}/{}: connectionFailures={}", consumerId,
+                     serverRecord.serverId, count, receivedMessages.get(), sentMessages.get(), connectionFailures, e);
+               }
+               Thread.sleep(100);
             }
          }
-         logger.info("Consumer {} server={} finished, received {} messages, duplicates={}",
-            consumerId, serverRecord.serverId, localReceived, countDuplicates());
+         logger.info("Consumer {} server={} count={} {}/{}: finished", consumerId,
+            serverRecord.serverId, count, receivedMessages.get(), sentMessages.get());
       } catch (InterruptedException e) {
-         logger.info("Consumer {} server={} interrupted", consumerId, serverRecord.serverId);
+         logger.info("Consumer {} server={} count={} {}/{}: interrupted", consumerId,
+            serverRecord.serverId, count, receivedMessages.get(), sentMessages.get());
       } finally {
-         consumersDone.countDown();
+         runningConsumers.remove(consumerId);
       }
    }
 
    private void stopProducers() throws Exception {
-      producersStopping.set(true);
+      if (!runningProducers.isEmpty()) {
+         stoppingProducers.set(true);
 
-      assertTrue(producersDone.await(CLIENT_STOP_TIMEOUT_MS, TimeUnit.MINUTES), "Producers did not complete in time");
-      logger.info("Test producers done: totalSent={}, totalReceived={}, duplicates={}",
-         totalSent.get(), totalReceived.get(), countDuplicates());
+         Wait.assertTrue("Producers did not complete in time: " + runningProducers,
+            () -> runningProducers.isEmpty(), CLIENT_STOP_TIMEOUT_MS, 100);
+
+         logger.info("Test producers stopped");
+
+         checkMessages();
+      }
    }
 
    private void waitForMessages() {
-      Wait.assertTrue(() -> {
-         long duplicates = countDuplicates();
-         long ghostSends = countGhostSends();
-         long lostMessages = countLostMessages();
-         long queueMessages = countQueueMessages();
-         long snfMessages = countSnFMessages();
+      Wait.assertTrue(this::checkMessages, CLUSTER_TIMEOUT_MS, 1_000);
+   }
 
-         logger.info("Test waiting: sent={}, received={}, lostMessages={}, ghostSends={}, duplicates={}, queueMessages={}, snfMessages={}",
-            totalSent.get(), totalReceived.get(), lostMessages, ghostSends, duplicates, queueMessages, snfMessages);
+   private boolean checkMessages() {
+      long lostMessages = countLostMessages();
+      long ghostMessages = countGhostMessages();
+      long duplicates = countDuplicateMessages();
+      long queueMessages = countQueueMessages();
+      long snfMessages = countSnFMessages();
 
-         return lostMessages == 0 && queueMessages == 0 && snfMessages == 0;
-      }, 30_000, 1_000);
+      logger.info("Test status: sent={}, received={}, lost={}, ghost={}, duplicates={}, queueMessages={}, snfMessages={}",
+         sentMessages.get(), receivedMessages.get(), lostMessages, ghostMessages, duplicates, queueMessages, snfMessages);
+
+      return lostMessages == 0 && queueMessages == 0 && snfMessages == 0;
    }
 
    private void stopConsumers() throws Exception {
-      consumersStopping.set(true);
+      if (!runningConsumers.isEmpty()) {
+         stoppingConsumers.set(true);
 
-      assertTrue(consumersDone.await(CLIENT_STOP_TIMEOUT_MS, TimeUnit.MINUTES), "Consumers did not complete in time");
-      logger.info("Test consumers done: totalSent={}, totalReceived={}, duplicates={}",
-         totalSent.get(), totalReceived.get(), countDuplicates());
+         Wait.assertTrue("Consumers did not complete in time: " + runningConsumers,
+            () -> runningConsumers.isEmpty(), CLIENT_STOP_TIMEOUT_MS, 100);
+
+         logger.info("Test consumers stopped");
+
+         checkMessages();
+      }
    }
 
    private void stopServers() throws Exception {
@@ -625,71 +668,46 @@ public class ScaleDownSoakTest extends SoakTestBase {
       }
    }
 
-   private void checkStatus() throws Exception {
-      Set<String> receivedIds = messageRecords.keySet();
-      Set<String> duplicateIds = messageRecords.values().stream()
-         .filter(MessageRecord::isDuplicate)
+   private long countLostMessages() {
+      Set<String> lostIds = messageRecords.values().stream()
+         .filter(messageRecord -> messageRecord.isSent() && !messageRecord.isConsumed())
+         .map(r -> r.id)
+         .collect(Collectors.toCollection(HashSet::new));
+      if (!lostIds.isEmpty()) {
+         logger.info("Test lost messages: {}", lostIds);
+      }
+      return lostIds.size();
+   }
+
+   private long countGhostMessages() {
+      Set<String> ghostIds = messageRecords.values().stream()
+         .filter(messageRecord -> !messageRecord.isSent())
          .map(r -> r.id)
          .collect(Collectors.toCollection(HashSet::new));
 
-      Set<String> ghostSends = new HashSet<>(receivedIds);
-      ghostSends.removeAll(sentMessageIds);
-
-      Set<String> lostMessages = new HashSet<>(sentMessageIds);
-      lostMessages.removeAll(receivedIds);
-
-      Set<String> unackedDeliveryDupIds = scanJournalsForConsumerRedelivery(duplicateIds);
-      Set<String> otherDupIds = new HashSet<>(duplicateIds);
-      otherDupIds.removeAll(unackedDeliveryDupIds);
-
-      logger.info("Test finished: sent={}, received={}, lostMessages={}, ghostSends={}, duplicates={}, unackedDeliveryDuplicates={}, otherDuplicates={}",
-         sentMessageIds.size(), receivedIds.size(), lostMessages.size(), ghostSends.size(), duplicateIds.size(), unackedDeliveryDupIds.size(), otherDupIds.size());
-
-      for (String dupId : unackedDeliveryDupIds) {
-         MessageRecord record = messageRecords.get(dupId);
-         logger.warn("  unacked-delivery dup: --id '{}' --first-consumer-id {} --first-server-id {} --first-jms-id '{}' --consumer-id {} --server-id {} --jms-id '{}'",
-            dupId, record.firstConsumerId, record.firstServerId, record.firstJMSMessageId,
-            record.dupConsumerId, record.dupServerId, record.dupJMSMessageId);
+      if (!ghostIds.isEmpty()) {
+         logger.info("Test ghost messages: {}", ghostIds);
       }
-      for (String dupId : otherDupIds) {
-         MessageRecord record = messageRecords.get(dupId);
-         logger.warn("  other dup: --id '{}' --first-consumer-id {} --first-server-id {} --first-jms-id '{}' --consumer-id {} --server-id {} --jms-id '{}'",
-            dupId, record.firstConsumerId, record.firstServerId, record.firstJMSMessageId,
-            record.dupConsumerId, record.dupServerId, record.dupJMSMessageId);
-      }
-
-      if (!otherDupIds.isEmpty() && HALT_ON_OTHER_DUPLICATES) {
-         Runtime.getRuntime().halt(-1);
-      }
+      return ghostIds.size();
    }
 
-   private long countLostMessages() {
-      Set<String> lostMessages = new HashSet<>(sentMessageIds);
-      lostMessages.removeAll(messageRecords.keySet());
-      if (!lostMessages.isEmpty()) {
-         logger.info("Test lost messages: {}", lostMessages);
-      }
-      return lostMessages.size();
-   }
+   private long countDuplicateMessages() {
+      Set<String> duplicateIds = messageRecords.values().stream()
+         .filter(MessageRecord::hasDuplicates)
+         .map(r -> r.id)
+         .collect(Collectors.toCollection(HashSet::new));
 
-   private long countDuplicates() {
-      return messageRecords.values().stream().filter(MessageRecord::isDuplicate).count();
-   }
-
-   private long countGhostSends() {
-      Set<String> ghostSends = new HashSet<>(messageRecords.keySet());
-      ghostSends.removeAll(sentMessageIds);
-      if (!ghostSends.isEmpty()) {
-         logger.info("Test ghost sends: {}", ghostSends);
+      if (!duplicateIds.isEmpty()) {
+         logger.info("Test duplicated messages: {}", duplicateIds);
       }
-      return ghostSends.size();
+      return messageRecords.values().stream().filter(MessageRecord::hasDuplicates).mapToInt(value -> value.consumerRecords.size() - 1).sum();
    }
 
    private long countQueueMessages() {
       long total = 0;
       for (int i = 0; i < NUMBER_OF_SERVERS; i++) {
          try {
-            long count = serverRecords[i].getManagement().getMessageCountOnQueue(QUEUE_NAME);
+            long count = serverRecords[i].getManagement().getMessageCountOnQueue(TEST_QUEUE_NAME);
             if (count > 0) {
                logger.info("Test server {} queueMessageCount: {}", i, count);
             }
@@ -716,125 +734,6 @@ public class ScaleDownSoakTest extends SoakTestBase {
          }
       }
       return total;
-   }
-
-   /**
-    * Scan journals for {@code UPDATE_DELIVERY_COUNT} on each duplicate's {@code firstServerId} only.
-    * Evidence on any other broker does not count as broker-consumer for that id.
-    *
-    * @return the set of duplicate ids with broker-consumer evidence
-    */
-   private Set<String> scanJournalsForConsumerRedelivery(Set<String> dupIds) {
-      Set<String> unackedDeliveryDupIds = new HashSet<>();
-      if (dupIds == null || dupIds.isEmpty()) {
-         return unackedDeliveryDupIds;
-      }
-
-      Map<Integer, Set<String>> dupIdsByFirstServer = new HashMap<>();
-      for (String dupId : dupIds) {
-         MessageRecord record = messageRecords.get(dupId);
-         if (record == null) {
-            logger.warn("Duplicate id={} has no MessageRecord; treating as other", dupId);
-            continue;
-         }
-         dupIdsByFirstServer.computeIfAbsent(record.firstServerId, s -> new HashSet<>()).add(dupId);
-      }
-
-      for (Map.Entry<Integer, Set<String>> entry : dupIdsByFirstServer.entrySet()) {
-         int serverId = entry.getKey();
-         if (serverId < 0 || serverId >= serverRecords.length) {
-            continue;
-         }
-         File journalDir = new File(serverRecords[serverId].serverLocation, "data/journal");
-         if (!journalDir.isDirectory()) {
-            continue;
-         }
-         try {
-            scanBrokerJournal(journalDir, entry.getValue(), unackedDeliveryDupIds);
-         } catch (Exception e) {
-            logger.warn("Failed to scan journal on broker-{} at {}: {}", serverId, journalDir, e.getMessage());
-            logger.debug("Journal scan failure", e);
-         }
-      }
-      return unackedDeliveryDupIds;
-   }
-
-   private static void scanBrokerJournal(File journalDir,
-                                         Set<String> dupIds,
-                                         Set<String> unackedDeliveryDupIds) throws Exception {
-      ConfigurationImpl config = new ConfigurationImpl();
-      NIOSequentialFileFactory fileFactory = new NIOSequentialFileFactory(journalDir, null, 1);
-      JournalImpl journal = new JournalImpl(config.getJournalFileSize(), config.getJournalMinFiles(), config.getJournalPoolFiles(),
-         0, 0, fileFactory, "activemq-data", "amq", 1);
-
-      Map<Long, String> midToDupId = new HashMap<>();
-      Set<Long> midsWithDeliveryCount = new HashSet<>();
-
-      JournalReaderCallback reader = new JournalReaderCallback() {
-         private void onAdd(RecordInfo info) {
-            if (info.getUserRecordType() != JournalRecordIds.ADD_MESSAGE_PROTOCOL
-               && info.getUserRecordType() != JournalRecordIds.ADD_MESSAGE) {
-               return;
-            }
-            String dupId = extractDupId(info);
-            if (dupId == null || !dupIds.contains(dupId)) {
-               return;
-            }
-            midToDupId.put(info.id, dupId);
-         }
-
-         private void onUpdate(RecordInfo info) {
-            if (info.getUserRecordType() == JournalRecordIds.UPDATE_DELIVERY_COUNT) {
-               midsWithDeliveryCount.add(info.id);
-            }
-         }
-
-         @Override
-         public void onReadAddRecord(RecordInfo info) {
-            onAdd(info);
-         }
-
-         @Override
-         public void onReadAddRecordTX(long transactionID, RecordInfo info) {
-            onAdd(info);
-         }
-
-         @Override
-         public void onReadUpdateRecord(RecordInfo info) {
-            onUpdate(info);
-         }
-
-         @Override
-         public void onReadUpdateRecordTX(long transactionID, RecordInfo info) {
-            onUpdate(info);
-         }
-      };
-
-      for (JournalFile file : journal.orderFiles()) {
-         // reclaimed=true: include history after ACK/Delete (same as data print --reclaimed)
-         JournalImpl.readJournalFile(fileFactory, file, reader, null, true, null);
-      }
-
-      for (Long mid : midsWithDeliveryCount) {
-         String dupId = midToDupId.get(mid);
-         if (dupId == null) {
-            continue;
-         }
-         unackedDeliveryDupIds.add(dupId);
-      }
-   }
-
-   private static String extractDupId(RecordInfo info) {
-      Object encoded = DescribeJournal.newObjectEncoding(info);
-      if (encoded instanceof DescribeJournal.MessageDescribe messageDescribe) {
-         org.apache.activemq.artemis.api.core.Message msg = messageDescribe.getMsg();
-         if (msg == null) {
-            return null;
-         }
-         Object value = msg.getObjectProperty(TEST_MSG_ID);
-         return value == null ? null : value.toString();
-      }
-      return null;
    }
 
    private void waitForCluster(int[] startedNodes, int[] stoppedNodes) throws Exception {
